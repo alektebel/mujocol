@@ -1,0 +1,103 @@
+<?xml version="1.0"?>
+<robot name="TwoLinkArm">
+  <!-- Base Link -->
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.4 0.1 0.4"/>
+      </geometry>
+      <material name="gray"/>
+    </visual>
+    <inertial>
+      <mass value="5.0"/>
+      <inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/>
+    </inertial>
+  </link>
+
+  <!-- Link 1 (Upper Arm) -->
+  <link name="link1">
+    <visual>
+      <origin xyz="0 0.4 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.06" length="0.8"/>
+      </geometry>
+      <material name="red"/>
+    </visual>
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/>
+    </inertial>
+  </link>
+
+  <!-- Link 2 (Forearm) -->
+  <link name="link2">
+    <visual>
+      <origin xyz="0 0.3 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.05" length="0.6"/>
+      </geometry>
+      <material name="blue"/>
+    </visual>
+    <inertial>
+      <mass value="0.5"/>
+      <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.005" iyz="0" izz="0.005"/>
+    </inertial>
+  </link>
+
+  <!-- End Effector -->
+  <link name="end_effector">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.08"/>
+      </geometry>
+      <material name="yellow"/>
+    </visual>
+    <inertial>
+      <mass value="0.1"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+
+  <!-- Joint 1: Base to Link1 (Shoulder - rotates around Y axis) -->
+  <joint name="shoulder_pan" type="revolute">
+    <parent link="base_link"/>
+    <child link="link1"/>
+    <origin xyz="0 0.05 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-3.14159" upper="3.14159" effort="100" velocity="1.0"/>
+  </joint>
+
+  <!-- Joint 2: Link1 to Link2 (Elbow - rotates around Z axis) -->
+  <joint name="elbow" type="revolute">
+    <parent link="link1"/>
+    <child link="link2"/>
+    <origin xyz="0 0.8 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.35619" upper="2.35619" effort="50" velocity="1.0"/>
+  </joint>
+
+  <!-- Joint 3: Link2 to End Effector (Wrist - rotates around Z axis) -->
+  <joint name="wrist" type="revolute">
+    <parent link="link2"/>
+    <child link="end_effector"/>
+    <origin xyz="0 0.6 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.5708" upper="1.5708" effort="20" velocity="1.0"/>
+  </joint>
+
+  <!-- Materials (for reference, parsed by name) -->
+  <material name="gray">
+    <color rgba="0.5 0.5 0.5 1"/>
+  </material>
+  <material name="red">
+    <color rgba="0.8 0.2 0.2 1"/>
+  </material>
+  <material name="blue">
+    <color rgba="0.2 0.4 0.8 1"/>
+  </material>
+  <material name="yellow">
+    <color rgba="0.9 0.9 0.2 1"/>
+  </material>
+</robot>

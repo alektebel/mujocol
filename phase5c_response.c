@@ -315,7 +315,9 @@ static Contact collide_sphere_sphere(RigidBody *a, RigidBody *b) {
  *
  * Steps:
  *
- * 1. POSITION CORRECTION (Baumgarte — push overlapping bodies apart):
+ * 1. POSITION CORRECTION (Baumgarte stabilization — push overlapping bodies apart):
+ *      The factor 0.8 is the Baumgarte correction fraction: correcting 80% of
+ *      penetration per step avoids overshooting while still converging quickly.
  *      correction = penetration * 0.8
  *      total_inv_mass = body->inv_mass + other->inv_mass   (other=0 if NULL)
  *      body->pos += normal * correction * body->inv_mass / total_inv_mass

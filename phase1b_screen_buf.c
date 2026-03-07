@@ -13,6 +13,44 @@
  * - Implement double buffering: back_buf → present → front_buf
  * - Only emit ANSI sequences for cells that changed (differential update)
  * - Use \033[row;colH to position cursor (1-indexed)
+ *
+ * ── TECHNIQUE OVERVIEW ──────────────────────────────────────────────
+ *
+ * 1. CELL STRUCT
+ *    A Cell represents one character-cell on the terminal screen: a
+ *    printable character (ch) plus a foreground color index (fg) and a
+ *    background color index (bg).  Both color fields use uint8_t (an
+ *    8-bit unsigned integer, range 0-255) because the 256-color ANSI
+ *    palette fits exactly in one byte — using uint8_t instead of int
+ *    cuts the per-cell footprint from ~12 bytes to 3 bytes, which
+ *    matters when you have tens of thousands of cells.
+ *
+ * 2. DOUBLE BUFFERING
+ *    The core idea comes from graphics: never let the observer (the
+ *    terminal) see a partially-drawn frame.  We keep two Cell arrays:
+ *      front_buf — what the terminal currently shows
+ *      back_buf  — the frame we are building right now
+ *    Drawing calls (set_cell, draw_str, draw_box) write only to
+ *    back_buf.  When the frame is complete, present() compares back to
+ *    front and updates the terminal, then copies back→front.  The
+ *    terminal never sees an intermediate state, so there is no flicker.
+ *
+ * 3. DIFFERENTIAL UPDATE
+ *    A naive renderer would redraw every cell every frame: for an 80×24
+ *    terminal that is 1920 cells × ~20 bytes of ANSI = ~38 KB per frame.
+ *    The performance trick in present() is to skip any cell where
+ *    back_buf[i] == front_buf[i] — only cells that actually changed are
+ *    emitted.  A typical animation touches <5 % of cells per frame, so
+ *    the byte count drops by 20× or more.
+ *
+ * 4. prev_fg / prev_bg OPTIMIZATION
+ *    Moving the cursor already costs ~10 bytes per cell (the CUP
+ *    sequence).  Setting a color costs another ~10 bytes.  When
+ *    consecutive dirty cells share the same foreground or background
+ *    color we can skip re-emitting that color sequence.  present() tracks
+ *    the last color it sent (prev_fg, prev_bg) and only emits a new color
+ *    escape when the color actually changes, saving bytes on runs of
+ *    same-colored text.
  */
 
 #define _POSIX_C_SOURCE 199309L
@@ -107,6 +145,21 @@ static void enable_raw_mode(void) {
  *   - Zero-initialize back_buf with calloc or memset
  *   - Initialize front_buf to impossible values to force a full first
  *     redraw: set every cell's fg = 255, bg = 255, ch = 0
+ *
+ * WHY "impossible" values for front_buf?
+ *   On the very first frame, front_buf must differ from back_buf for
+ *   every cell so that present() draws the entire screen.  We set
+ *   fg = 255 and bg = 255 because valid terminal draws will rarely
+ *   (or never) use color index 255 for both fg and bg simultaneously,
+ *   and ch = 0 is a non-printable character that no real cell will
+ *   contain.  Together these three values form an "impossible" sentinel
+ *   that guarantees every cell is treated as dirty on the first pass.
+ *
+ * WHY calloc for back_buf?
+ *   calloc zero-initialises memory, so every cell starts as
+ *   { ch=0, fg=0, bg=0 } — a null character with color index 0 (black).
+ *   That is a valid and harmless initial state; we will overwrite it
+ *   with clear_back_buf() before the first present() anyway.
  * ══════════════════════════════════════════════════════════════════ */
 static void alloc_buffers(int w, int h) {
     /* TODO: Allocate and initialize front/back cell buffers */
@@ -118,6 +171,14 @@ static void alloc_buffers(int w, int h) {
  *
  * Fill every cell in back_buf (buf_w * buf_h cells) with the given
  * character, foreground color, and background color.
+ *
+ * WHY this step exists:
+ *   Think of back_buf as a framebuffer in OpenGL — before you draw
+ *   anything you call glClear() to fill it with a known background
+ *   color.  clear_back_buf() is the terminal equivalent: it floods the
+ *   canvas with a uniform background (typically a space character with
+ *   a chosen bg color) so that anything left over from the previous
+ *   logical frame is erased before new objects are drawn on top.
  * ══════════════════════════════════════════════════════════════════ */
 static void clear_back_buf(char ch, uint8_t fg, uint8_t bg) {
     /* TODO: Fill back_buf uniformly */
@@ -130,6 +191,14 @@ static void clear_back_buf(char ch, uint8_t fg, uint8_t bg) {
  * Should:
  *   - Return immediately if x or y is out of bounds
  *   - Write ch, fg, bg into back_buf[y * buf_w + x]
+ *
+ * THE 1-D INDEX FORMULA  y * buf_w + x
+ *   The Cell array is stored in row-major order: all cells of row 0
+ *   come first, then all cells of row 1, etc.  Row y starts at index
+ *   y × buf_w, and column x is x positions into that row, giving the
+ *   combined index y×buf_w + x.  This is the same memory layout used
+ *   by 2-D C arrays: if you declared Cell grid[H][W], then
+ *   grid[y][x] and buf[y*W+x] refer to the same byte offset.
  * ══════════════════════════════════════════════════════════════════ */
 static void set_cell(int x, int y, char ch, uint8_t fg, uint8_t bg) {
     /* TODO: Bounds-check and write cell into back_buf */
@@ -155,6 +224,37 @@ static void set_cell(int x, int y, char ch, uint8_t fg, uint8_t bg) {
  *
  * Use local variables prev_fg and prev_bg (initialise to 255) to
  * avoid emitting redundant color-change sequences.
+ *
+ * DIFFERENTIAL UPDATE — the loop in detail:
+ *   Comparing back_buf[i] to front_buf[i] is the differential update.
+ *   If the cell is unchanged we skip it entirely — no cursor move, no
+ *   color escape, no character byte.  Only cells that actually changed
+ *   since the last present() call generate output.
+ *
+ * "\033[%d;%dH" — CUP (Cursor Position):
+ *   \033 is the ESC byte (explained in phase1a).  The sequence
+ *   ESC [ row ; col H moves the cursor to that position.  ANSI row/col
+ *   are 1-indexed, so we add 1 to our 0-indexed C array coordinates:
+ *   row+1 and col+1.
+ *
+ * "\033[38;5;%dm" / "\033[48;5;%dm" — 256-color fg / bg:
+ *   These sequences (explained in phase1a) select a foreground or
+ *   background color from the 256-color palette.  The optimization
+ *   here: we only emit the sequence when the color differs from the
+ *   last color we sent (prev_fg / prev_bg).  Consecutive dirty cells
+ *   that share the same color skip the ~10-byte color escape entirely.
+ *
+ * Copying back→front (step 5):
+ *   After emitting a cell's content we write back_buf[i] into
+ *   front_buf[i].  This marks the cell as "in sync": on the next frame,
+ *   if back_buf[i] hasn't changed again, the comparison will find them
+ *   equal and skip the cell.
+ *
+ * out_flush() at the end:
+ *   All the cursor-moves, color changes, and characters accumulated in
+ *   out_buf are sent to the terminal in a single write() call.  Batching
+ *   is critical: many small write() calls would stall waiting for the
+ *   kernel each time, causing visible tearing.
  * ══════════════════════════════════════════════════════════════════ */
 static void present(void) {
     /* TODO: Render changed cells to the terminal */
@@ -181,6 +281,12 @@ static void draw_str(int x, int y, const char *s, uint8_t fg, uint8_t bg) {
  *
  * Only draw the border cells; leave the interior untouched.
  * All characters use the provided fg and bg color indices.
+ *
+ * WHY ASCII '+', '-', '|' instead of Unicode box-drawing glyphs?
+ *   Unicode has dedicated box-drawing characters (e.g. ┌─┐│└┘) but
+ *   they are multi-byte UTF-8 sequences.  Using plain ASCII means the
+ *   code works correctly in any locale, any terminal, and with our
+ *   single-byte Cell struct — no UTF-8 encoding logic needed.
  * ══════════════════════════════════════════════════════════════════ */
 static void draw_box(int x, int y, int w, int h, uint8_t fg, uint8_t bg) {
     /* TODO: Draw box border into back_buf */

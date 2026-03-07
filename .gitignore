@@ -1,0 +1,39 @@
+# Compiled binaries (host architecture)
+phase1_term
+phase2_math3d
+phase3_sdf_render
+phase4_camera
+phase5_physics
+phase6_scene
+phase7_sim
+phase8_rl
+phase9_robot_sdf
+phase8_rl_sol
+phase9_robot_sdf_sol
+
+# Sub-phase exercise binaries
+phase1a_raw_mode
+phase1b_screen_buf
+phase1c_animation
+phase2a_vec3
+phase2b_mat4
+phase2c_quat
+phase3a_sdf_prims
+phase3b_ray_march
+phase3c_shading
+phase4a_orbit_pos
+phase4b_orbit_input
+phase4c_orbit_smooth
+phase5a_body_init
+phase5b_collision
+phase5c_response
+phase6a_xml_parse
+phase6b_urdf_load
+phase6c_fk_render
+
+# aarch64 cross-compiled binaries
+*.aarch64
+
+# Vim swap files
+*.swp
+*.swo

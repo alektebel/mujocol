@@ -156,7 +156,7 @@ static void enable_raw_mode(void) {
  *   that guarantees every cell is treated as dirty on the first pass.
  *
  * WHY calloc for back_buf?
- *   calloc zero-initialises memory, so every cell starts as
+ *   calloc zero-initializes memory, so every cell starts as
  *   { ch=0, fg=0, bg=0 } — a null character with color index 0 (black).
  *   That is a valid and harmless initial state; we will overwrite it
  *   with clear_back_buf() before the first present() anyway.
@@ -222,7 +222,7 @@ static void set_cell(int x, int y, char ch, uint8_t fg, uint8_t bg) {
  *       6. Update prev_fg / prev_bg
  *   - After the loop, call out_flush()
  *
- * Use local variables prev_fg and prev_bg (initialise to 255) to
+ * Use local variables prev_fg and prev_bg (initialize to 255) to
  * avoid emitting redundant color-change sequences.
  *
  * DIFFERENTIAL UPDATE — the loop in detail:

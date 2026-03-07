@@ -269,7 +269,7 @@ static void draw_border(void) {
  * struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 }  — field by field:
  *   fd      = STDIN_FILENO : watch standard input
  *   events  = POLLIN       : we want to know when data can be read
- *   revents = 0            : output field, initialised to 0 by us
+ *   revents = 0            : output field, initialized to 0 by us
  *
  * poll(&pfd, 1, 0) arguments:
  *   &pfd   — pointer to the array of pollfd structs
@@ -402,7 +402,7 @@ static void update_balls(float dt) {
  *
  * ARRAY POPULATION:
  *   Loop i from 0 to MAX_BALLS-1 and fill balls[i].  All MAX_BALLS
- *   entries are initialised even though only num_balls are active;
+ *   entries are initialized even though only num_balls are active;
  *   this allows the user to enable more balls at runtime ('+' key)
  *   without reinitialising them on the fly.
  * ══════════════════════════════════════════════════════════════════ */

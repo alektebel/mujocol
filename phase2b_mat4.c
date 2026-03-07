@@ -12,6 +12,44 @@
  * - Build rotation matrices from Rodrigues' formula
  * - Construct look-at view matrices for cameras
  * - Compute the inverse of affine transform matrices
+ *
+ * ──────────────────────────────────────────────────────────────────
+ * TECHNIQUE OVERVIEW
+ * ──────────────────────────────────────────────────────────────────
+ *
+ * 1. Column-major matrix storage
+ *    A 4×4 matrix has 16 floats. OpenGL (and this code) stores them
+ *    in column-major order: column 0 first, then column 1, etc.
+ *    The flat array index for element at row r, column c is: c*4 + r.
+ *    The macro M4(mat, row, col) encodes this: (mat).m[(col)*4 + (row)].
+ *    This differs from row-major (C's native 2D array) where the index
+ *    would be r*4 + c. When you read M4(m, row, col) it looks natural,
+ *    but the memory layout is column-first.
+ *
+ * 2. Homogeneous coordinates
+ *    We use 4D vectors (x, y, z, w) to represent 3D points and
+ *    directions in a unified way. Points have w=1; directions/vectors
+ *    have w=0. This allows translation to be expressed as a matrix
+ *    multiply (not possible with pure 3×3 matrices). The fourth row
+ *    [0,0,0,1] ensures w stays 1 after multiplying by an affine matrix.
+ *
+ * 3. vec4
+ *    New in this phase: a 4-tuple (x,y,z,w). v4_from_v3(p, 1.0f) turns
+ *    a 3D point into homogeneous form. v4_to_v3 drops the w component.
+ *    m4_mul_point divides by w after the multiply (perspective divide)
+ *    to handle projective transforms.
+ *
+ * 4. m4_identity
+ *    The identity matrix has 1s on the diagonal and 0s elsewhere. Any
+ *    vector multiplied by identity is unchanged. Note:
+ *    m.m[0]=m.m[5]=m.m[10]=m.m[15]=1.0f exploits column-major layout:
+ *    index 0 is [row=0,col=0], index 5 is [row=1,col=1], etc.
+ *
+ * 5. Transform composition
+ *    The power of matrices: T*R*S (translate, rotate, scale) means
+ *    "scale first, then rotate, then translate" when we write M * point.
+ *    Matrix multiplication is associative: (A*B)*C = A*(B*C).
+ *    Non-commutative: A*B ≠ B*A in general.
  */
 
 #include <stdio.h>
@@ -139,6 +177,12 @@ static mat4 m4_perspective(float fov_rad, float aspect, float near, float far) {
  * Use the M4(mat, row, col) macro to access elements.
  * result[row, col] = sum over k of a[row, k] * b[k, col]
  * Remember: column-major storage — M4 handles the index math for you.
+ *
+ * Matrix multiplication C=A×B means: C[row,col] = sum of
+ * A[row,k]*B[k,col] for k=0..3. Think of it as: each element of the
+ * result is the dot product of one row of A with one column of B.
+ * We use three nested loops: outer=row, middle=col, inner=k.
+ * The M4 macro handles the column-major index arithmetic.
  * ══════════════════════════════════════════════════════════════════ */
 static mat4 m4_mul(mat4 a, mat4 b) {
     /* TODO: implement 4×4 matrix multiplication */
@@ -154,6 +198,13 @@ static mat4 m4_mul(mat4 a, mat4 b) {
  * | sin(θ)   cos(θ)   0   0 |
  * |   0        0      1   0 |
  * |   0        0      0   1 |
+ *
+ * A pure rotation leaves vectors in the rotation plane, while the
+ * perpendicular axis is unchanged. For Z-rotation: vectors in the XY
+ * plane rotate by θ, while Z is fixed. The cos/sin entries come from
+ * the unit circle: a vector (1,0) rotated by θ becomes (cosθ, sinθ).
+ * The negative sin in position [0,1] comes from the right-hand rule
+ * (counter-clockwise positive when looking down +Z).
  * ══════════════════════════════════════════════════════════════════ */
 static mat4 m4_rotate_z(float rad) {
     /* TODO: build Z-rotation matrix */
@@ -169,6 +220,11 @@ static mat4 m4_rotate_z(float rad) {
  * | 0  cos(θ)  -sin(θ)  0 |
  * | 0  sin(θ)   cos(θ)  0 |
  * | 0    0       0    1 |
+ *
+ * Same pattern as Z-rotation but now X is the fixed axis, and the YZ
+ * plane rotates. When implementing: start from m4_identity(), then
+ * set the four elements that change:
+ *   [1,1]=cos, [1,2]=-sin, [2,1]=sin, [2,2]=cos.
  * ══════════════════════════════════════════════════════════════════ */
 static mat4 m4_rotate_x(float rad) {
     /* TODO: build X-rotation matrix */
@@ -184,6 +240,17 @@ static mat4 m4_rotate_x(float rad) {
  * | t*x*y+s*z  t*y*y+c    t*y*z-s*x  0 |
  * | t*x*z-s*y  t*y*z+s*x  t*z*z+c    0 |
  * |    0          0          0        1 |
+ *
+ * Rodrigues' rotation formula generalizes to ANY axis. The formula
+ * decomposes as:
+ *   (1) component of v along axis (unchanged):  t*dot(axis,v)*axis
+ *   (2) component perpendicular to axis
+ *       (scaled by cosθ):                       c*v_perp
+ *   (3) component perpendicular to both
+ *       (cross product, scaled by sinθ):         s*(axis × v)
+ * Expanding these into matrix form gives the 3×3 block shown above.
+ * Must normalize the axis first: a non-unit axis would scale the
+ * vector.
  * ══════════════════════════════════════════════════════════════════ */
 static mat4 m4_rotate_axis(vec3 axis, float rad) {
     /* TODO: implement Rodrigues' rotation formula */
@@ -199,6 +266,19 @@ static mat4 m4_rotate_axis(vec3 axis, float rad) {
  * 2. right   = normalize(cross(forward, up))
  * 3. up      = cross(right, forward)
  * 4. Rotation rows are right, up, -forward; translation is -dot(row, eye)
+ *
+ * The look-at matrix builds a view coordinate frame.
+ * Step 1: forward = normalize(target-eye) — the camera's -Z axis.
+ * Step 2: right = normalize(forward × up) — the camera's +X axis;
+ *         must normalize again because forward and up may not be
+ *         perpendicular.
+ * Step 3: true_up = right × forward — recomputes up perpendicular to
+ *         both forward and right (handles non-perpendicular input up).
+ * Step 4: The rotation rows are right, true_up, -forward (we negate
+ *         forward because cameras look down -Z by convention).
+ * Step 5: The translation part is -dot(right,eye), -dot(true_up,eye),
+ *         +dot(forward,eye) — this moves the world so the eye is at
+ *         the origin.
  * ══════════════════════════════════════════════════════════════════ */
 static mat4 m4_look_at(vec3 eye, vec3 target, vec3 up) {
     /* TODO: build look-at view matrix */
@@ -214,6 +294,15 @@ static mat4 m4_look_at(vec3 eye, vec3 target, vec3 up) {
  * Hint: compute all 16 cofactors, transpose to get adjugate,
  *       then divide each element by the determinant.
  *       Return identity if det ≈ 0 (singular matrix).
+ *
+ * The general 4×4 inverse uses cofactor expansion.
+ * A cofactor C_ij = (-1)^(i+j) * det(minor), where minor is the 3×3
+ * submatrix obtained by deleting row i and col j.
+ * The adjugate matrix is the transpose of the cofactor matrix.
+ * The inverse is: adjugate / det.
+ * For affine transforms (translation + rotation + scale), there is a
+ * faster method: inverse = [R^T, -R^T*t; 0,0,0,1], but the full
+ * general method works for all cases.
  * ══════════════════════════════════════════════════════════════════ */
 static mat4 m4_inverse(mat4 m) {
     /* TODO: implement full 4×4 matrix inverse */

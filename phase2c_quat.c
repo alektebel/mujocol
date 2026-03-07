@@ -13,6 +13,49 @@
  * - Convert between quaternions, axis-angle, and rotation matrices
  * - Use SLERP for smooth quaternion interpolation
  * - Build combined transform pipelines (TRS = Translate * Rotate * Scale)
+ *
+ * ──────────────────────────────────────────────────────────────────
+ * TECHNIQUE OVERVIEW
+ * ──────────────────────────────────────────────────────────────────
+ *
+ * 1. Quaternions
+ *    A quaternion q = w + xi + yj + zk has a scalar part w and a 3D
+ *    vector part (x,y,z). The imaginary units satisfy
+ *    i²=j²=k²=ijk=-1. A unit quaternion (|q|=1) represents a 3D
+ *    rotation: rotating by angle θ around unit axis n gives
+ *    q = (cos(θ/2), sin(θ/2)*n). Note: in this code the struct is
+ *    defined as {w, x, y, z} — w first.
+ *
+ * 2. Why quaternions over matrices/Euler?
+ *    Three reasons: (a) 4 floats vs 16 (compact); (b) no gimbal lock
+ *    (a problem with Euler angles where one rotational degree of
+ *    freedom can be lost); (c) smooth SLERP interpolation between
+ *    rotations.
+ *
+ * 3. Gimbal lock
+ *    When using Euler angles (yaw/pitch/roll), if pitch=90° the yaw
+ *    and roll axes align, losing one degree of freedom. Quaternions
+ *    don't have this problem because they live in a 4D space with no
+ *    such degeneracies.
+ *
+ * 4. Hamilton product
+ *    Quaternion multiplication is non-commutative (q1*q2 ≠ q2*q1).
+ *    Multiplying two unit quaternions q1*q2 gives a unit quaternion
+ *    that represents the combined rotation: "first rotate by q2, then
+ *    by q1" (right-to-left convention, like matrix multiplication).
+ *
+ * 5. SLERP
+ *    Spherical Linear intERPolation: interpolates between two
+ *    quaternions along the great-circle arc on the unit 4-sphere.
+ *    Formula: slerp(q1,q2,t) = q1*(sin((1-t)*Ω)/sin(Ω)) +
+ *    q2*(sin(t*Ω)/sin(Ω)), where Ω = acos(q1·q2). Falls back to
+ *    linear interpolation when Ω≈0 (quaternions nearly identical).
+ *    Essential for smooth animation blending.
+ *
+ * 6. TRS = Translate * Rotate * Scale
+ *    The standard decomposition of a rigid body transform. "Scale
+ *    first" means the geometry is scaled in local space before any
+ *    rotation or translation is applied.
  */
 
 #include <stdio.h>
@@ -144,6 +187,10 @@ static inline quat q_norm(quat q) {
 
 static quat q_slerp(quat a, quat b, float t) {
     float dot = a.w*b.w + a.x*b.x + a.y*b.y + a.z*b.z;
+    /* dot < 0 means the two quaternions are on opposite hemispheres of
+     * the 4-sphere. Negating one of them (q2 = -q2) gives the equivalent
+     * rotation but ensures we take the short path (< 180°), avoiding
+     * spinning the 'long way around'. */
     if (dot < 0) {
         b = (quat){-b.w, -b.x, -b.y, -b.z};
         dot = -dot;
@@ -170,6 +217,13 @@ static quat q_slerp(quat a, quat b, float t) {
  *   y = axis.y * sin(θ/2)
  *   z = axis.z * sin(θ/2)
  * Normalize the axis first if it is not already a unit vector.
+ *
+ * A unit quaternion for rotation θ around normalized axis n is:
+ * w = cos(θ/2), (x,y,z) = sin(θ/2) * n. The half-angle is key:
+ * going from angle to quaternion halves the angle. This is why
+ * rotating by 360° gives q = (-1,0,0,0) (not identity): you need
+ * 720° to return to identity in quaternion space — but both q and
+ * -q represent the same rotation.
  * ══════════════════════════════════════════════════════════════════ */
 static inline quat q_from_axis_angle(vec3 axis, float rad) {
     /* TODO: create quaternion from axis and angle */
@@ -184,6 +238,14 @@ static inline quat q_from_axis_angle(vec3 axis, float rad) {
  * x = a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y
  * y = a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x
  * z = a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w
+ *
+ * The Hamilton product of q1=(w1,x1,y1,z1) and q2=(w2,x2,y2,z2):
+ *   w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+ *   x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+ *   y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+ *   z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+ * The negative terms come from the rules i²=-1, j²=-1, k²=-1,
+ * ij=k, jk=i, ki=j, ji=-k, kj=-i, ik=-j.
  * ══════════════════════════════════════════════════════════════════ */
 static inline quat q_mul(quat a, quat b) {
     /* TODO: implement Hamilton product */
@@ -199,6 +261,13 @@ static inline quat q_mul(quat a, quat b) {
  *   uv  = cross(qv, v)
  *   uuv = cross(qv, uv)
  *   return v + 2 * (q.w * uv + uuv)
+ *
+ * To rotate vector v by unit quaternion q: treat v as a pure
+ * quaternion p=(0,v.x,v.y,v.z), then compute q*p*q_conj, where
+ * q_conj=(w,-x,-y,-z). The xyz part of the result is the rotated
+ * vector. An alternative (faster) formula using the cross product:
+ *   result = v + 2*q.w*(q_vec × v) + 2*(q_vec × (q_vec × v)),
+ * where q_vec=(q.x,q.y,q.z).
  * ══════════════════════════════════════════════════════════════════ */
 static vec3 q_rotate(quat q, vec3 v) {
     /* TODO: rotate vector v by quaternion q */
@@ -214,6 +283,13 @@ static vec3 q_rotate(quat q, vec3 v) {
  * |  2(xy+wz)   1-2(x²+z²)   2(yz-wx)   0 |
  * |  2(xz-wy)    2(yz+wx)   1-2(x²+y²)  0 |
  * |     0           0           0        1 |
+ *
+ * Converting a unit quaternion (w,x,y,z) to a 3×3 rotation matrix:
+ *   m[0][0]=1-2(y²+z²), m[0][1]=2(xy-wz),   m[0][2]=2(xz+wy)
+ *   m[1][0]=2(xy+wz),   m[1][1]=1-2(x²+z²), m[1][2]=2(yz-wx)
+ *   m[2][0]=2(xz-wy),   m[2][1]=2(yz+wx),   m[2][2]=1-2(x²+y²)
+ * The fourth row and column are [0,0,0,1] (no translation). Embed
+ * this 3×3 into a 4×4 using M4() and return.
  * ══════════════════════════════════════════════════════════════════ */
 static mat4 q_to_mat4(quat q) {
     /* TODO: convert quaternion to 4×4 rotation matrix */
@@ -227,6 +303,11 @@ static mat4 q_to_mat4(quat q) {
  * Build a combined Translate × Rotate × Scale matrix:
  *   TRS = m4_translate(t) × q_to_mat4(r) × m4_scale(s)
  * This is the standard model-to-world transform in 3D engines.
+ *
+ * TRS = m4_translate(t) * q_to_mat4(r) * m4_scale(s). Order matters:
+ * scale in local space first (s), then rotate to world orientation
+ * (r), then translate to world position (t). Using m4_mul from
+ * phase2b to combine them.
  * ══════════════════════════════════════════════════════════════════ */
 static mat4 m4_trs(vec3 t, quat r, vec3 s) {
     /* TODO: return m4_translate(t) * q_to_mat4(r) * m4_scale(s) */
@@ -240,6 +321,14 @@ static mat4 m4_trs(vec3 t, quat r, vec3 s) {
  * Build individual axis quaternions then compose in XYZ order:
  *   q = q_z * q_y * q_x
  * where q_x = q_from_axis_angle((1,0,0), rx), etc.
+ *
+ * Euler angles (roll=X, pitch=Y, yaw=Z) are applied in XYZ order:
+ * create three quaternions:
+ *   qx = q_from_axis_angle({1,0,0}, roll)
+ *   qy = q_from_axis_angle({0,1,0}, pitch)
+ *   qz = q_from_axis_angle({0,0,1}, yaw)
+ * then multiply: q = qz * qy * qx (right-to-left: X applied first).
+ * The order is critical — different orders give different orientations.
  * ══════════════════════════════════════════════════════════════════ */
 static quat q_from_euler(float rx, float ry, float rz) {
     /* TODO: compose Euler angles into a single quaternion */

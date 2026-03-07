@@ -16,6 +16,49 @@
  *     x      = sin(azimuth) * xz_r
  *     z      = cos(azimuth) * xz_r
  * - Add the offset to a target point to get world position
+ *
+ * TECHNIQUE OVERVIEW:
+ *
+ * 1. SPHERICAL COORDINATES
+ *    A point in 3D space can be described as (r, θ, φ) instead of (x,y,z):
+ *      r   = distance from origin (radius of the sphere)
+ *      θ   = azimuth — horizontal angle measured from the +Z axis in the XZ
+ *              plane, positive toward +X  (like compass bearing)
+ *      φ   = elevation — vertical angle above (+) or below (-) the XZ plane
+ *    This representation is natural for an orbit camera: "sit 5 units away,
+ *    facing 45° to the left and 20° above the horizon" maps directly to
+ *    (dist=5, az=π/4, el=π/9) without any coordinate arithmetic.
+ *
+ * 2. SPHERICAL → CARTESIAN CONVERSION
+ *    Given azimuth az, elevation el, distance dist, and a target point:
+ *
+ *      y_offset  = sin(el) * dist          [vertical rise]
+ *      xz_radius = cos(el) * dist          [horizontal reach from Y axis]
+ *      x_offset  = sin(az) * xz_radius     [east/west component]
+ *      z_offset  = cos(az) * xz_radius     [north/south component]
+ *      camera_pos = target + (x_offset, y_offset, z_offset)
+ *
+ *    cos(el) shrinks the horizontal circle as el approaches ±π/2 (poles).
+ *    At el=0 the camera sits exactly on the XZ plane; at el=π/2 it is
+ *    directly above the target.
+ *
+ * 3. LOOK-AT MATRIX (from phase2b)
+ *    Once we have camera_pos we pass it to orbit_camera_get_ray(), which
+ *    builds the view basis vectors inline:
+ *      forward = normalize(target − pos)
+ *      right   = normalize(cross(forward, world_up))   world_up = (0,1,0)
+ *      up      = cross(right, forward)
+ *    This is equivalent to m4_look_at().  Rays are then constructed by
+ *    offsetting forward with right/up scaled by the half-FOV tangent.
+ *    The orbit camera is simply spherical coords + look-at.
+ *
+ * 4. WHY ORBIT CAMERAS?
+ *    They are the standard paradigm for inspecting 3D objects.  Every
+ *    modelling tool (Blender, Maya, 3ds Max) uses one.  The three
+ *    intuitive controls map cleanly to the three spherical parameters:
+ *      Orbit (tumble) → change azimuth and/or elevation
+ *      Zoom           → change distance
+ *      Pan            → change target
  */
 
 #define _POSIX_C_SOURCE 199309L
@@ -260,16 +303,36 @@ typedef struct {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #1: Compute camera world position from spherical coordinates
  *
- * Convert spherical (smooth_az, smooth_el, smooth_dist) to a Cartesian
- * offset from target, then add target:
+ * The orbit camera lives on the surface of a sphere of radius
+ * smooth_dist centred at cam->target.  Converting its spherical
+ * coordinates to Cartesian follows three trigonometric steps:
  *
- *   y      = sin(elevation) * distance         [vertical component]
- *   xz_r   = cos(elevation) * distance         [horizontal radius]
- *   x      = sin(azimuth)   * xz_r
- *   z      = cos(azimuth)   * xz_r
+ * STEP 1 — Vertical offset (y)
+ *   y = sin(elevation) * distance
+ *   sin(el) gives the fraction of 'distance' used for the Y axis.
+ *   When el = 0 the camera is level; when el = π/2 it is directly
+ *   above the target.
+ *
+ * STEP 2 — Horizontal radius (xz_r)
+ *   xz_r = cos(elevation) * distance
+ *   cos(el) gives the radius of the circle the camera traces in the
+ *   XZ plane.  At el = 0 the full distance is horizontal; at el = π/2
+ *   xz_r collapses to 0 (camera is at the top pole).
+ *
+ * STEP 3 — X and Z components using azimuth
+ *   x = sin(azimuth) * xz_r
+ *   z = cos(azimuth) * xz_r
+ *   The azimuth rotates the camera around the Y axis.  At az = 0 the
+ *   camera is on the +Z side; at az = π/2 it is on the +X side.
+ *
+ * STEP 4 — World position
  *   result = target + (x, y, z)
+ *   Adding the offset to the target gives the camera's absolute world
+ *   position, which render_frame passes to the ray-marcher.
  *
- * Use the smooth_* fields, NOT the raw azimuth/elevation/distance.
+ * IMPORTANT: use cam->smooth_az / smooth_el / smooth_dist (not the
+ * raw azimuth/elevation/distance).  Phase 4c will make the smooth
+ * values lag behind the raw ones to create the inertia effect.
  * ══════════════════════════════════════════════════════════════════ */
 static vec3 orbit_camera_pos(OrbitCamera *cam) {
     /* TODO: Convert spherical coords to world position */
@@ -280,15 +343,38 @@ static vec3 orbit_camera_pos(OrbitCamera *cam) {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #2: Generate a ray from the camera through screen pixel (u, v)
  *
- * u, v are normalized screen coords in [-1, 1].
- * Steps:
- *   1. pos      = orbit_camera_pos(cam)
- *   2. forward  = normalize(target - pos)
- *   3. right    = normalize(cross(forward, world_up))  world_up=(0,1,0)
- *   4. up       = cross(right, forward)
- *   5. half_fov = tan(fov * 0.5)
- *   6. *ro = pos
- *   7. *rd = normalize(forward + right*u*half_fov + up*v*half_fov)
+ * u and v are normalised screen coordinates in [-1, 1] (u is the
+ * horizontal axis scaled by aspect ratio; v is vertical, +1 = top).
+ *
+ * Build an orthonormal camera basis, then offset the forward vector
+ * to aim through the requested pixel:
+ *
+ * STEP 1 — Camera position
+ *   pos = orbit_camera_pos(cam)   [world position from TODO #1]
+ *
+ * STEP 2 — Forward direction (from camera toward target)
+ *   forward = normalize(target − pos)
+ *
+ * STEP 3 — Right direction (perpendicular to forward, in XZ plane)
+ *   right = normalize(cross(forward, world_up))   world_up = (0,1,0)
+ *   cross(forward, up) gives a vector pointing to the camera's right.
+ *   Normalising it ensures the basis is orthonormal.
+ *
+ * STEP 4 — Up direction (camera's local up, perpendicular to both)
+ *   up = cross(right, forward)
+ *   This re-derives the true up vector from the other two axes,
+ *   so it stays perpendicular even when the camera is tilted.
+ *
+ * STEP 5 — Half-FOV tangent
+ *   half_fov = tan(fov * 0.5)
+ *   This scales the right/up offsets so pixels near the edge of the
+ *   screen correspond to the correct viewing angle.
+ *
+ * STEP 6 — Ray origin and direction
+ *   *ro = pos
+ *   *rd = normalize(forward + right * u * half_fov
+ *                            + up    * v * half_fov)
+ *   Multiplying by u/v places the pixel; normalising gives a unit ray.
  * ══════════════════════════════════════════════════════════════════ */
 static void orbit_camera_get_ray(OrbitCamera *cam, float u, float v,
                                   vec3 *ro, vec3 *rd) {

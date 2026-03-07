@@ -13,6 +13,54 @@
  * - Convert RPY (roll-pitch-yaw) to rotation matrix: Rz * Ry * Rx
  * - Build joint transform: origin_tf * joint_rotation_tf
  * - Render articulated geometry using per-link world transforms
+ *
+ * ──────────────────────────────────────────────────────────────────
+ * TECHNIQUE OVERVIEW
+ * ──────────────────────────────────────────────────────────────────
+ *
+ * 1. FORWARD KINEMATICS (FK)
+ *    FK answers: given joint angles, where is each link in world space?
+ *    We propagate transforms from the root down the tree.  For each joint:
+ *      world_transform[child] =
+ *          world_transform[parent] * joint_origin_tf * joint_rotation_tf
+ *    The root link's world_transform is the identity matrix (it sits at the
+ *    origin of the world coordinate frame).
+ *
+ * 2. JOINT TRANSFORM CONSTRUCTION
+ *    Each joint contributes two matrices that are multiplied together:
+ *      joint_origin_tf  = m4_translate(joint.origin_xyz)
+ *                         * rpy_to_mat4(joint.origin_rpy)
+ *        — the fixed offset from the parent link frame to the joint frame.
+ *      joint_rotation_tf = m4_rotate_axis(joint.axis, joint.position)
+ *        — the current revolute rotation (or prismatic slide for JOINT_PRISMATIC).
+ *      For JOINT_FIXED: joint_rotation_tf = m4_identity().
+ *    The combined per-joint transform passed down the tree is:
+ *      joint_tf = m4_mul(joint_origin_tf, joint_rotation_tf)
+ *
+ * 3. RPY (ROLL-PITCH-YAW) TO ROTATION MATRIX
+ *    URDF stores orientation as three Euler angles: roll (X-axis), pitch
+ *    (Y-axis), yaw (Z-axis).  The URDF convention is extrinsic: apply roll
+ *    first, then pitch, then yaw.  In matrix form (applied right-to-left):
+ *      R = Rz(yaw) * Ry(pitch) * Rx(roll)
+ *    Using the axis-rotation helpers from phase2b:
+ *      m4_mul(m4_rotate_z(rpy.z), m4_mul(m4_rotate_y(rpy.y), m4_rotate_x(rpy.x)))
+ *
+ * 4. DEPTH-FIRST TRAVERSAL
+ *    To propagate FK, we traverse the joint array in order (URDF files
+ *    list joints in topological order — parent before child).  For each
+ *    joint, we look up its parent link's already-computed world_transform,
+ *    multiply by the joint's local transform, and write the result into
+ *    the child link's world_transform.  This single linear pass is
+ *    equivalent to a depth-first traversal when the array is topologically
+ *    ordered.
+ *
+ * 5. RENDERING WITH LINK TRANSFORMS
+ *    Once world_transform[i] is known for each link, the SDF renderer
+ *    evaluates the link's geometry in world space by transforming the query
+ *    point into link-local space:
+ *      vec3 lp = m4_transform_point(m4_inverse(world_transform[i]), p_world);
+ *    Then the primitive SDF (sphere, box, cylinder) is evaluated at lp,
+ *    which is in the link's local frame where the geometry is centred.
  */
 
 #define _POSIX_C_SOURCE 199309L
@@ -447,15 +495,19 @@ static int load_urdf(const char *filename) {
  * TODO #1: rpy_to_mat4 — convert roll-pitch-yaw to a rotation matrix
  *
  * In URDF the convention is: first rotate around X by roll, then Y by
- * pitch, then Z by yaw, so the combined matrix is Rz * Ry * Rx.
+ * pitch, then Z by yaw (extrinsic / fixed-axis rotations).  In matrix
+ * notation, because we apply roll first, it is the rightmost factor:
+ *   R = Rz(yaw) * Ry(pitch) * Rx(roll)
  *
  * Algorithm:
- *   mat4 rx = m4_rotate_x(rpy.x);   // roll
- *   mat4 ry = m4_rotate_y(rpy.y);   // pitch
- *   mat4 rz = m4_rotate_z(rpy.z);   // yaw
+ *   mat4 rx = m4_rotate_x(rpy.x);   // roll  around X
+ *   mat4 ry = m4_rotate_y(rpy.y);   // pitch around Y
+ *   mat4 rz = m4_rotate_z(rpy.z);   // yaw   around Z
  *   return m4_mul(rz, m4_mul(ry, rx));
  *
- * All three helper functions (m4_rotate_x/y/z) are already implemented above.
+ * All three helper functions (m4_rotate_x/y/z) are already implemented
+ * in the math section above.  This function is called by joint_transform()
+ * to convert the <origin rpy="..."/> attribute into a rotation matrix.
  * ══════════════════════════════════════════════════════════════════ */
 static mat4 rpy_to_mat4(vec3 rpy) {
     /* TODO: Build rotation matrix from roll (X), pitch (Y), yaw (Z).
@@ -467,17 +519,28 @@ static mat4 rpy_to_mat4(vec3 rpy) {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #2: joint_transform — build the parent→child local transform
  *
+ * This combines two pieces: the fixed origin offset stored in the URDF
+ * and the current joint motion (rotation or translation).
+ *
  * Algorithm:
- *   1. origin_tf = m4_mul(m4_translate(j->origin_xyz),
- *                         rpy_to_mat4(j->origin_rpy));
- *   2. Choose joint_dof based on j->type:
+ *   1. Build the origin transform from the joint's xyz + rpy:
+ *        mat4 origin_tf = m4_mul(m4_translate(j->origin_xyz),
+ *                                rpy_to_mat4(j->origin_rpy));
+ *      This moves from the parent link's frame to the joint frame.
+ *   2. Build the degree-of-freedom transform based on joint type:
  *        JOINT_REVOLUTE / JOINT_CONTINUOUS:
- *          joint_dof = m4_rotate_axis(j->axis, j->position)
+ *          mat4 dof_tf = m4_rotate_axis(j->axis, j->position);
+ *          // Rotates around j->axis by j->position radians.
  *        JOINT_PRISMATIC:
- *          joint_dof = m4_translate(v3_scale(j->axis, j->position))
- *        JOINT_FIXED (default):
- *          joint_dof = m4_identity()
- *   3. Return m4_mul(origin_tf, joint_dof).
+ *          mat4 dof_tf = m4_translate(v3_scale(j->axis, j->position));
+ *          // Slides along j->axis by j->position metres.
+ *        JOINT_FIXED (and default):
+ *          mat4 dof_tf = m4_identity();
+ *          // No motion; the child is rigidly attached to the parent.
+ *   3. Return the combined transform:
+ *        return m4_mul(origin_tf, dof_tf);
+ *      This matrix maps points in the child link's local frame into the
+ *      parent link's local frame.
  * ══════════════════════════════════════════════════════════════════ */
 static mat4 joint_transform(Joint *j) {
     /* TODO: Combine origin offset (xyz + rpy) with joint motion (angle/slide) */
@@ -489,17 +552,28 @@ static mat4 joint_transform(Joint *j) {
  * TODO #3: compute_fk — propagate world transforms through the tree
  *
  * Assumption: joints are stored in topological order (parent before child),
- * which is the typical order in a well-formed URDF.
+ * which is the typical order in a well-formed URDF file.  This means a
+ * single linear pass through the joints array is sufficient — no recursion
+ * or explicit stack required.
  *
  * Algorithm:
- *   1. If robot.root_link is valid, set
- *        robot.links[robot.root_link].world_transform = m4_identity();
- *   2. For i = 0 .. robot.num_joints - 1:
- *        Joint *j = &robot.joints[i];
- *        if j->parent_link < 0 || j->child_link < 0: continue
- *        mat4 parent_world = robot.links[j->parent_link].world_transform;
- *        mat4 jt           = joint_transform(j);
- *        robot.links[j->child_link].world_transform = m4_mul(parent_world, jt);
+ *   1. Initialise the root link to the world origin (identity transform):
+ *        if (robot.root_link >= 0 && robot.root_link < robot.num_links)
+ *            robot.links[robot.root_link].world_transform = m4_identity();
+ *   2. Iterate every joint in array order:
+ *        for (int i = 0; i < robot.num_joints; i++) {
+ *            Joint *j = &robot.joints[i];
+ *            // Skip joints with invalid link indices.
+ *            if (j->parent_link < 0 || j->child_link < 0) continue;
+ *            // Retrieve the already-computed parent world transform.
+ *            mat4 parent_world = robot.links[j->parent_link].world_transform;
+ *            // Build the local joint transform (origin + dof).
+ *            mat4 jt = joint_transform(j);
+ *            // Child world transform = parent world * joint local.
+ *            robot.links[j->child_link].world_transform =
+ *                m4_mul(parent_world, jt);
+ *        }
+ *   Note: the stub below already writes the root identity — add the loop body.
  * ══════════════════════════════════════════════════════════════════ */
 static void compute_fk(void) {
     /* TODO: Set root to identity, then propagate each joint's transform */
@@ -533,25 +607,43 @@ static float sdf_plane(vec3 p, vec3 n, float o) { return v3_dot(p,n) + o; }
 /* ══════════════════════════════════════════════════════════════════
  * TODO #4: scene_sdf — build the SDF scene from robot link geometry
  *
+ * The SDF (signed distance function) for the entire scene is the union of
+ * all link geometries plus a ground plane.  The union is computed with
+ * fminf: keep whichever shape is closest (most negative distance).
+ *
  * Algorithm:
- *   1. Start with hit = {1e10f, 0}.
+ *   1. Initialise:  SceneHit hit = {1e10f, 0};
+ *      (1e10 is "no hit yet"; any real geometry will be closer.)
  *   2. Ground plane:
- *        d = sdf_plane(p, v3(0,1,0), 0.5f);
+ *        float d = sdf_plane(p, v3(0,1,0), 0.5f);
+ *        // Normal (0,1,0) = up; offset 0.5 places the ground at y = -0.5.
  *        if (d < hit.dist) { hit.dist = d; hit.material_id = 0; }
  *   3. For each link i in [0, robot.num_links):
- *        a. Transform the query point into link-local space:
+ *        Geometry *geom = &robot.links[i].visual;
+ *        a. Transform p into link-local space:
  *             mat4 inv = m4_inverse(robot.links[i].world_transform);
  *             vec3 lp  = m4_transform_point(inv, p);
- *        b. Subtract the visual origin offset:
+ *           This undoes the link's world transform so the primitive SDF
+ *           can be evaluated in local coordinates.
+ *        b. Apply the visual origin offset (geometry may not be at link origin):
  *             vec3 op = v3_sub(lp, geom->origin_xyz);
- *        c. Evaluate the SDF for the geometry type:
- *             GEOM_SPHERE   → d = sdf_sphere_f(op, v3(0,0,0), geom->radius)
- *             GEOM_BOX      → d = sdf_box_f(op, v3(0,0,0), geom->size)
- *             GEOM_CYLINDER → d = sdf_cylinder_f(op,
- *                                   v3(0, -geom->length*0.5f, 0),
- *                                   geom->radius, geom->length)
- *        d. Update hit:
- *             if (d < hit.dist) { hit.dist = d; hit.material_id = 1 + (geom->color_id % 8); }
+ *        c. Evaluate the geometry SDF:
+ *             GEOM_SPHERE:
+ *               d = sdf_sphere_f(op, v3(0,0,0), geom->radius)
+ *             GEOM_BOX:
+ *               d = sdf_box_f(op, v3(0,0,0), geom->size)
+ *               // geom->size stores half-extents already
+ *             GEOM_CYLINDER:
+ *               d = sdf_cylinder_f(op,
+ *                     v3(0, -geom->length * 0.5f, 0),
+ *                     geom->radius, geom->length)
+ *               // base is at local y = -half_length so the cylinder
+ *               // is centred on the link origin
+ *        d. Update closest hit:
+ *             if (d < hit.dist) {
+ *                 hit.dist = d;
+ *                 hit.material_id = 1 + (geom->color_id % 8);
+ *             }
  *   4. Return hit.
  * ══════════════════════════════════════════════════════════════════ */
 static SceneHit scene_sdf(vec3 p) {
@@ -568,16 +660,29 @@ static SceneHit scene_sdf(vec3 p) {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #5: adjust_joint — increment a joint's position with clamping
  *
+ * Called from the interactive loop when the user presses [+]/[-] or
+ * the arrow keys to animate the selected joint.
+ *
  * Algorithm:
- *   1. Bounds-check: if joint_idx < 0 || joint_idx >= robot.num_joints: return.
- *   2. j = &robot.joints[joint_idx].
- *   3. j->position += delta.
- *   4. For revolute joints (JOINT_REVOLUTE), clamp to [lower_limit, upper_limit]:
- *        if (j->position < j->lower_limit) j->position = j->lower_limit;
- *        if (j->position > j->upper_limit) j->position = j->upper_limit;
- *      For continuous joints (JOINT_CONTINUOUS), no clamping (unlimited rotation).
- *      For prismatic joints, clamp similarly.
- *      For fixed joints, force position back to 0.
+ *   1. Bounds-check:
+ *        if (joint_idx < 0 || joint_idx >= r->num_joints) return;
+ *   2. Obtain a pointer to the joint:
+ *        Joint *j = &r->joints[joint_idx];
+ *   3. Apply the increment:
+ *        j->position += delta;
+ *   4. Enforce joint limits based on type:
+ *        JOINT_REVOLUTE / JOINT_PRISMATIC:
+ *          Clamp to [lower_limit, upper_limit]:
+ *            if (j->position < j->lower_limit) j->position = j->lower_limit;
+ *            if (j->position > j->upper_limit) j->position = j->upper_limit;
+ *        JOINT_CONTINUOUS:
+ *          No clamping — the joint can spin freely.  Optionally wrap to
+ *          [-π, π] with fmodf for numerical cleanliness, but not required.
+ *        JOINT_FIXED:
+ *          Force back to zero:  j->position = 0.0f;
+ *          (The user shouldn't be able to move a fixed joint.)
+ *   After this call the main loop sets fk_dirty = 1, which triggers
+ *   compute_fk() to recompute all world transforms before the next frame.
  * ══════════════════════════════════════════════════════════════════ */
 static void adjust_joint(Robot *r, int joint_idx, float delta) {
     /* TODO: Increment joint position, clamp for revolute/prismatic joints */

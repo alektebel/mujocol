@@ -15,6 +15,44 @@
  * - Apply distance fog for depth cues
  */
 
+/* ══════════════════════════════════════════════════════════════════
+ * TECHNIQUE OVERVIEW
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * 1. Surface normal from SDF gradient
+ *    At a surface point p, the gradient of the SDF (the direction of
+ *    steepest increase) equals the surface normal.  We estimate it
+ *    with central finite differences:
+ *      normal.x = sdf(p + eps*X) - sdf(p - eps*X)
+ *    divide by 2*eps, repeat for Y and Z, then normalize.  This works
+ *    for ANY SDF shape without needing explicit normal geometry.
+ *
+ * 2. Phong shading model
+ *    Three components:
+ *    (a) ambient  = constant base light (so shadows aren't pitch black)
+ *    (b) diffuse  = max(0, dot(normal, light_dir)) — Lambertian
+ *        reflectance, simulates matte surfaces
+ *    (c) specular = pow(max(0, dot(reflect(-light_dir,normal),
+ *        view_dir)), shininess) — sharp highlight for shiny surfaces
+ *
+ * 3. Shadow rays
+ *    From the surface point, cast another ray toward the light.  If it
+ *    hits anything before reaching the light, the point is in shadow.
+ *    We offset the ray start by a small amount along the normal to
+ *    avoid "self-intersection" (the point hitting its own surface).
+ *
+ * 4. ASCII luminance mapping
+ *    Map a luminance value [0..1] to a character from a density ramp.
+ *    The ramp goes from dense ('@') through medium ('o') to sparse
+ *    ('.') to space.  Characters like "@#%Oo*+:-. " go from full
+ *    (luminance≈1) to empty (luminance≈0).
+ *
+ * 5. Distance fog
+ *    Apply exponential attenuation e^(-k*t) where t is the ray travel
+ *    distance.  Objects far away fade to the background color.  The
+ *    constant k controls fog density.
+ * ══════════════════════════════════════════════════════════════════ */
+
 #define _POSIX_C_SOURCE 199309L
 #define _DEFAULT_SOURCE
 #include <stdio.h>
@@ -296,7 +334,17 @@ typedef struct { char ch; uint8_t fg; uint8_t bg; float lum; } ShadeResult;
  * to the surface, which is exactly the outward normal direction.
  * ══════════════════════════════════════════════════════════════════ */
 static vec3 calc_normal(vec3 p) {
-    /* TODO: Compute surface normal via central finite differences of scene_dist() */
+    /* TODO: Compute surface normal via central finite differences of scene_dist()
+     * Central finite differences:
+     *   float eps = 0.001f;
+     *   nx = scene_dist(v3_add(p, v3(eps,0,0)))
+     *      - scene_dist(v3_sub(p, v3(eps,0,0)));
+     * (similarly for ny, nz).  Then:
+     *   return v3_norm(v3(nx, ny, nz));
+     * The eps should be small enough to approximate the derivative but
+     * large enough to avoid floating-point noise.  0.001 is a common
+     * choice for scenes with features sized ~1 unit.
+     */
     (void)p;
     return v3(0, 1, 0);  /* placeholder — returns up vector */
 }
@@ -319,7 +367,14 @@ static vec3 calc_normal(vec3 p) {
  * Hint: call ray_march(shadow_origin, light_dir) and check result.hit
  * ══════════════════════════════════════════════════════════════════ */
 static float cast_shadow(vec3 p, vec3 light_dir) {
-    /* TODO: Cast a shadow ray and return a shadow factor in [0.3, 1.0] */
+    /* TODO: Cast a shadow ray and return a shadow factor in [0.3, 1.0]
+     * Start a shadow ray from `p + normal*0.02f` (small bias to avoid
+     * self-hit) toward the light.  March it; if it hits something with
+     * t < light_distance, return a shadow factor < 1.0 (e.g. 0.3 for
+     * hard shadow).  Otherwise return 1.0 (fully lit).  Soft shadows
+     * can be approximated with the "soft shadow" formula: track the
+     * minimum `k*d/t` along the ray.
+     */
     (void)p; (void)light_dir;
     return 1.0f;  /* placeholder — no shadows */
 }
@@ -334,7 +389,13 @@ static float cast_shadow(vec3 p, vec3 light_dir) {
  * The fog density constant (0.05) can be tuned: larger = thicker fog.
  * ══════════════════════════════════════════════════════════════════ */
 static float apply_fog(float lum, float dist) {
-    /* TODO: Multiply lum by an exponential falloff based on dist */
+    /* TODO: Multiply lum by an exponential falloff based on dist
+     * Fog formula: `lum * expf(-fog_k * dist)`.
+     * Using `expf(-k*d)`: at d=0, multiplier=1.0 (no fog); as d→∞,
+     * multiplier→0 (full fog).  Typical values: fog_k = 0.1 to 0.3.
+     * This is the same formula as Beer's Law (light absorption in a
+     * medium).
+     */
     (void)dist;
     return lum;  /* placeholder — no fog applied */
 }
@@ -366,7 +427,21 @@ static float apply_fog(float lum, float dist) {
  * ══════════════════════════════════════════════════════════════════ */
 static ShadeResult shade_point(vec3 p, vec3 rd, vec3 normal, int mat_id, float dist) {
     ShadeResult result = {' ', 16, 16, 0.0f};
-    /* TODO: Implement Phong shading and fill result.ch, result.fg, result.lum */
+    /* TODO: Implement Phong shading and fill result.ch, result.fg, result.lum
+     * Phong step by step:
+     * (1) `normal = get_normal(p)`
+     * (2) `light_dir = normalize(light_pos - p)`
+     * (3) `view_dir  = normalize(cam_pos - p)`
+     * (4) `ambient   = ambient_strength` (e.g. 0.1)
+     * (5) `diffuse   = diffuse_strength * max(0, dot(normal, light_dir))`
+     * (6) `reflect_dir = v3_reflect(-light_dir, normal)`
+     *     [v3_reflect from phase2a]
+     * (7) `specular = specular_strength
+     *                 * pow(max(0, dot(reflect_dir, view_dir)), shininess)`
+     * (8) `lum = clamp(ambient + diffuse + specular, 0, 1)`
+     * (9) Shadow: multiply diffuse+specular by shadow factor.
+     * Map lum to an ASCII ramp character and a color index.
+     */
     (void)p; (void)rd; (void)normal; (void)mat_id; (void)dist;
     return result;
 }
@@ -397,7 +472,13 @@ static ShadeResult shade_point(vec3 p, vec3 rd, vec3 normal, int mat_id, float d
  * ══════════════════════════════════════════════════════════════════ */
 static void render_frame_shaded(Camera *cam) {
     float aspect = (float)term_w / (term_h * 2.0f);
-    /* TODO: Render scene with full Phong shading, shadows, and fog */
+    /* TODO: Render scene with full Phong shading, shadows, and fog
+     * Same loop as phase3b, but now instead of a simple
+     * distance-based character, call shade_point(hit_pos) to get
+     * the Phong-shaded character and color.  Apply fog with
+     * apply_fog(lum, t).  The result is a fully lit, shadowed scene
+     * rendered with ASCII art.
+     */
     (void)cam; (void)aspect;
     for (int y = 0; y < term_h; y++)
         for (int x = 0; x < term_w; x++)

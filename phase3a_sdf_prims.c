@@ -16,6 +16,50 @@
  * - Test your SDFs at known points to verify correctness
  */
 
+/* ══════════════════════════════════════════════════════════════════
+ * TECHNIQUE OVERVIEW
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * 1. What is an SDF (Signed Distance Field)?
+ *    A function f(p) that, for any 3D point p, returns the shortest
+ *    signed distance to a surface.  Negative = inside the object,
+ *    zero = on the surface, positive = outside.  The "signed" part is
+ *    what makes them powerful: you always know if you're inside or
+ *    outside.
+ *
+ * 2. Why SDFs are useful
+ *    (a) Ray marching: you can safely step a ray forward by f(p) each
+ *        iteration — you can never overshoot the surface.
+ *    (b) Boolean operations: union is just min(), intersection is
+ *        max(), subtraction is max(a,-b).
+ *    (c) Smooth blending: smin() lets two objects blend into each
+ *        other.
+ *    These are impossible with triangle meshes.
+ *
+ * 3. The box SDF trick
+ *    The formula `length(max(q,0)) + min(max_component(q),0)`
+ *    elegantly handles all three cases:
+ *    (a) Outside all faces: q has positive components, max(q,0)=q,
+ *        length gives the corner distance.
+ *    (b) On a face: one component 0, length is edge distance.
+ *    (c) Inside: all q negative, max(q,0)=zero vector so length=0,
+ *        min(max_comp,0) gives the negative interior distance (the
+ *        penetration depth of the nearest face).
+ *
+ * 4. SDF combinators
+ *    Already provided in the file:
+ *      sdf_union(a,b)     = min(a,b)  — take the closer surface
+ *      sdf_intersection(a,b) = max(a,b)  — keep only overlap
+ *      sdf_subtract(a,b)  = max(a,-b) — cut b out of a
+ *    Note that sdf_subtract negates b to flip its inside/outside.
+ *
+ * 5. 1e10f sentinel
+ *    The TODO stubs return 1e10f (10 billion), which acts as "no
+ *    intersection" (infinitely far away).  The ray marcher stops when
+ *    a hit is detected (SDF < small epsilon), so returning a huge
+ *    value means "miss".
+ * ══════════════════════════════════════════════════════════════════ */
+
 #include <stdio.h>
 #include <math.h>
 
@@ -76,7 +120,13 @@ static float sdf_plane(vec3 p, vec3 normal, float offset) {
  * Test: sdf_sphere(v3(1,0,0), v3(0,0,0), 1.0f) should return ~0.0
  * ══════════════════════════════════════════════════════════════════ */
 static float sdf_sphere(vec3 p, vec3 center, float radius) {
-    /* TODO: Implement sphere SDF */
+    /* TODO: Implement sphere SDF
+     * The sphere is the simplest SDF: distance to center minus radius.
+     * In code: `return v3_len(v3_sub(p, center)) - radius;`
+     * Think of it as: if you draw a circle of radius `r` around the
+     * center, any point on that circle is at distance 0 from the
+     * sphere surface.
+     */
     (void)p; (void)center; (void)radius;
     return 1e10f;
 }
@@ -95,7 +145,21 @@ static float sdf_sphere(vec3 p, vec3 center, float radius) {
  * Hint: use v3_abs(), v3_sub(), v3_max(), v3_max_comp(), v3_len()
  * ══════════════════════════════════════════════════════════════════ */
 static float sdf_box(vec3 p, vec3 center, vec3 half_size) {
-    /* TODO: Implement box SDF */
+    /* TODO: Implement box SDF
+     * Step by step:
+     * (1) `q = v3_abs(v3_sub(p, center))` — fold space into the
+     *     positive octant (exploit box symmetry).  Then
+     *     `q = v3_sub(q, half_size)` — shift so q.x=0 at the face,
+     *     positive outside, negative inside.
+     * (2) `v3_max(q, v3(0,0,0))` keeps only the outside (positive)
+     *     parts — for corners/edges this is the 3D distance vector to
+     *     the nearest corner.
+     * (3) `v3_max_comp(q)` is the largest component — if inside the
+     *     box (all q negative), this is the least-negative, i.e.
+     *     distance to nearest face from inside (negative).
+     * Combine:
+     *   `v3_len(v3_max(q,0)) + fminf(v3_max_comp(q), 0.0f)`
+     */
     (void)p; (void)center; (void)half_size;
     return 1e10f;
 }
@@ -112,7 +176,14 @@ static float sdf_box(vec3 p, vec3 center, vec3 half_size) {
  * at distance R from the center. The torus lies in the XZ plane.
  * ══════════════════════════════════════════════════════════════════ */
 static float sdf_torus(vec3 p, vec3 center, float R, float r) {
-    /* TODO: Implement torus SDF */
+    /* TODO: Implement torus SDF
+     * `q = sqrtf(rel.x*rel.x + rel.z*rel.z) - R` computes how far the
+     * point is from the torus ring axis (a circle of radius R in the
+     * XZ plane).  The result q is now a 2D "distance from the ring"
+     * scalar.  Then `sqrtf(q*q + rel.y*rel.y) - r` is just a 2D
+     * circle SDF in the (q, rel.y) plane — finding the distance to
+     * the tube of radius r.
+     */
     (void)p; (void)center; (void)R; (void)r;
     return 1e10f;
 }
@@ -130,7 +201,14 @@ static float sdf_torus(vec3 p, vec3 center, float R, float r) {
  * This gives the signed distance to the swept sphere.
  * ══════════════════════════════════════════════════════════════════ */
 static float sdf_capsule(vec3 p, vec3 a, vec3 b, float r) {
-    /* TODO: Implement capsule SDF */
+    /* TODO: Implement capsule SDF
+     * The key insight: project the query point p onto the line segment
+     * a→b.  `h = clamp(dot(pa,ba)/dot(ba,ba), 0, 1)` gives the
+     * parameter of the closest point.  When h=0, the closest point is
+     * a; when h=1 it's b; in between it's on the segment.  The
+     * distance from p to that closest point minus r gives the SDF.
+     * `dot(ba,ba)` = `|ba|²` normalizes the parameter to [0,1] range.
+     */
     (void)p; (void)a; (void)b; (void)r;
     return 1e10f;
 }
@@ -151,7 +229,20 @@ static float sdf_capsule(vec3 p, vec3 a, vec3 b, float r) {
  * The second term is negative inside and zero outside (interior handling).
  * ══════════════════════════════════════════════════════════════════ */
 static float sdf_cylinder(vec3 p, vec3 base, float radius, float height) {
-    /* TODO: Implement cylinder SDF */
+    /* TODO: Implement cylinder SDF
+     * We decompose into 2D:
+     * (1) `d_radial = sqrt(rel.x²+rel.z²) - radius` is the signed
+     *     distance from the infinite cylinder wall.
+     * (2) `d_vertical = fabsf(rel.y - height/2.0f) - height/2.0f` is
+     *     the signed distance from the top/bottom cap planes (we center
+     *     rel.y at height/2).
+     * Then combine like the box SDF:
+     *   `d = length(max2(v2(d_radial,d_vertical), 0))
+     *        + min(max(d_radial,d_vertical), 0)`
+     * When both d_radial<0 and d_vertical<0 (inside), the combined
+     * distance is `max(d_radial,d_vertical)` (distance to nearest
+     * boundary).
+     */
     (void)p; (void)base; (void)radius; (void)height;
     return 1e10f;
 }
@@ -173,7 +264,16 @@ static float sdf_cylinder(vec3 p, vec3 base, float radius, float height) {
  * Hint: use v3_min_comp(), v3_len()
  * ══════════════════════════════════════════════════════════════════ */
 static float sdf_ellipsoid(vec3 p, vec3 center, vec3 radii) {
-    /* TODO: Implement approximate ellipsoid SDF */
+    /* TODO: Implement approximate ellipsoid SDF
+     * `q = v3_sub(p,center)`.  Scale:
+     * `v3(q.x/radii.x, q.y/radii.y, q.z/radii.z)` transforms space
+     * so the ellipsoid becomes the unit sphere.  `v3_len(scaled)-1.0f`
+     * is the unit-sphere SDF in scaled space.  Multiplying by
+     * `v3_min_comp(radii)` converts back to an approximate world-space
+     * distance.  This underestimates the true distance (so it's
+     * conservative — you won't overshoot), making it safe for ray
+     * marching.
+     */
     (void)p; (void)center; (void)radii;
     return 1e10f;
 }
@@ -186,6 +286,12 @@ static float sdf_ellipsoid(vec3 p, vec3 center, vec3 radii) {
  *   intersect  — only where both shapes overlap (logical AND)
  *   subtract   — cut shape b out of shape a (logical NOT b)
  *   smooth_union — blended/melted union with radius k
+ *
+ * The union combinator min(a,b) picks the closer surface — this is
+ * how scenes are built: union all primitives together and you get a
+ * single SDF for the whole scene.  The smooth-min variant (smin)
+ * blends surfaces within distance k, creating organic merging of
+ * shapes.
  * ══════════════════════════════════════════════════════════════════ */
 static inline float sdf_union(float a, float b)     { return fminf(a, b); }
 static inline float sdf_intersect(float a, float b) { return fmaxf(a, b); }

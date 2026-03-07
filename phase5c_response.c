@@ -14,6 +14,68 @@
  * - Implement position correction to prevent body overlap (Baumgarte stabilization)
  * - Add friction impulse to simulate surface friction
  * - Integrate equations of motion with semi-implicit Euler
+ *
+ * TECHNIQUE OVERVIEW:
+ *
+ * 1. IMPULSE-BASED COLLISION RESPONSE
+ *    Rather than applying continuous forces (which need time-integration and
+ *    can go unstable), we apply an instantaneous velocity change (impulse J).
+ *    For body A at contact point P, moment arm r_A = P - pos_A:
+ *      Δv_A  =  J / m_A             (linear velocity change)
+ *      Δω_A  =  (r_A × J) / I_A    (angular velocity change)
+ *    The cross product r_A × J is the torque arm; dividing by I_A gives the
+ *    angular acceleration integrated over an infinitesimal timestep.
+ *
+ * 2. IMPULSE MAGNITUDE FORMULA
+ *    For bodies A and B, restitution e (0 = inelastic, 1 = elastic):
+ *
+ *      j = -(1+e) * v_rel·n
+ *          ─────────────────────────────────────────────────────────────
+ *          1/m_A + 1/m_B + (r_A×n)·(I_A⁻¹*(r_A×n)) + (r_B×n)·(I_B⁻¹*(r_B×n))
+ *
+ *    where v_rel = v_A + ω_A×r_A − (v_B + ω_B×r_B)  at the contact point.
+ *    Numerator:   -(1+e)*v_rel·n  — relative approach speed, scaled by bounce.
+ *    Denominator: sum of linear (1/m) and rotational (cross-product) responses.
+ *    If v_rel·n > 0 the bodies are already separating — skip the impulse.
+ *
+ * 3. BAUMGARTE STABILIZATION
+ *    Impulses correct velocities but not positions.  Floating-point errors
+ *    accumulate each step, causing bodies to slowly drift into each other.
+ *    Baumgarte adds a "correction velocity" (bias) proportional to the
+ *    penetration depth directly into the impulse numerator:
+ *      bias = BAUMGARTE_FRACTION * depth / dt
+ *    This gently pushes overlapping bodies apart over several frames.
+ *    Typical fraction: 0.2–0.8.  Too large → jittery; too small → slow drift.
+ *    Here we use 0.8 (80 % correction per step).
+ *
+ * 4. FRICTION IMPULSE
+ *    After the normal impulse, we compute the tangential (friction) impulse.
+ *    Tangent direction: t = normalize(v_rel − (v_rel·n)*n)
+ *      — the relative velocity component perpendicular to the contact normal.
+ *    Friction impulse magnitude (Coulomb model):
+ *      j_t = −dot(v_rel, t) / total_inv_mass
+ *      j_t = clamp(j_t, −mu*|j|, mu*|j|)   ← friction cone
+ *    mu = FRICTION constant.  Clamping ensures friction can only oppose
+ *    relative tangential motion, never reverse it.
+ *
+ * 5. SEMI-IMPLICIT EULER INTEGRATION
+ *    Two ways to step position forward:
+ *      Explicit Euler:       v_new = v + a*dt;  pos_new = pos + v*dt
+ *      Semi-implicit Euler:  v_new = v + a*dt;  pos_new = pos + v_new*dt  ← this one
+ *    Using the NEW velocity for the position update (symplectic / semi-implicit)
+ *    conserves energy much better for oscillating/bouncing systems.  It is only
+ *    one line different from explicit Euler but dramatically more stable.
+ *
+ * 6. QUATERNION INTEGRATION
+ *    To update orientation from angular velocity ω over timestep dt:
+ *      q' = q + 0.5 * q ⊗ (0, ω_x, ω_y, ω_z) * dt
+ *    (0, ω_x, ω_y, ω_z) is a "pure quaternion" (zero scalar part).
+ *    The Hamilton product q ⊗ ω_quat converts the body-space angular velocity
+ *    into a quaternion derivative.  After adding, renormalise q' to prevent
+ *    length drift (accumulated floating-point errors would make q non-unit).
+ *    In practice we convert ω to an axis-angle and compose rotations:
+ *      dq = q_from_axis_angle(normalize(ω), |ω|*dt)
+ *      q' = q_norm(dq ⊗ q)
  */
 
 #define _POSIX_C_SOURCE 199309L
@@ -330,13 +392,16 @@ static Contact collide_sphere_sphere(RigidBody *a, RigidBody *b) {
  *
  * 3. NORMAL COMPONENT — skip if bodies already separating:
  *      vn = dot(vel_contact, normal)
- *      if (vn > 0) return;
+ *      if (vn > 0) return;    // positive vn means moving apart — no impulse
  *
  * 4. IMPULSE MAGNITUDE:
- *      rxn = cross(r, normal)
- *      rot_term  = dot(rxn, rxn) * body->inv_inertia
- *      (add other's rotational term if other != NULL)
+ *      rxn      = cross(r, normal)
+ *      rot_term = dot(rxn, rxn) * body->inv_inertia
+ *                 + (other's equivalent if other != NULL)
  *      j = -(1 + RESTITUTION) * vn / (total_inv_mass + rot_term)
+ *      The rot_term captures how much the rotational inertia "absorbs"
+ *      the impulse.  For a body with very large inertia, rot_term ≈ 0
+ *      and only the linear 1/m terms matter.
  *
  * 5. APPLY LINEAR IMPULSE:
  *      body->vel  += normal * j * body->inv_mass
@@ -345,6 +410,7 @@ static Contact collide_sphere_sphere(RigidBody *a, RigidBody *b) {
  * 6. APPLY ANGULAR IMPULSE:
  *      body->angular_vel  += cross(r,  normal*j) * body->inv_inertia
  *      other->angular_vel -= cross(r2, normal*j) * other->inv_inertia (if other)
+ *      (cross(r, J) gives the torque arm; multiplying by inv_inertia gives Δω)
  *
  * 7. Call apply_friction(body, c, other, j) for the tangential component.
  * ══════════════════════════════════════════════════════════════════ */
@@ -372,17 +438,25 @@ static void resolve_collision(RigidBody *body, Contact *c, RigidBody *other) {
  * TODO #2: Friction impulse
  *
  * Called from resolve_collision() with the normal impulse magnitude j.
+ * Friction opposes the tangential relative motion at the contact point.
  *
  * Steps:
- *   1. Recompute vel_contact (same as in resolve_collision)
+ *   1. Recompute vel_contact (same as in resolve_collision):
+ *        r  = c->point - body->pos
+ *        vel_contact = body->vel + cross(body->angular_vel, r)
+ *        if other: subtract other->vel + cross(other->angular_vel, r2)
+ *
  *   2. tangent = vel_contact - normal * dot(vel_contact, normal)
+ *      This strips the normal component, leaving only the tangential velocity.
  *      tlen    = length(tangent)
- *      if tlen < EPSILON: no tangential motion, return
- *      tangent = tangent / tlen                 [normalise]
+ *      if tlen < EPSILON: no tangential motion, return early
+ *      tangent = tangent / tlen     [normalise to get friction direction]
  *
  *   3. jt = -dot(vel_contact, tangent) / total_inv_mass
- *      Clamp to Coulomb friction cone:
- *        jt = clamp(jt, -FRICTION * |j|,  FRICTION * |j|)
+ *      Clamp to the Coulomb friction cone (can't exceed mu * normal impulse):
+ *        float max_jt = FRICTION * fabsf(j);
+ *        jt = jt < -max_jt ? -max_jt : (jt > max_jt ? max_jt : jt);
+ *      Clamping ensures friction can decelerate but never reverse motion.
  *
  *   4. Apply tangential linear impulse:
  *        body->vel  += tangent * jt * body->inv_mass
@@ -406,15 +480,29 @@ static void apply_friction(RigidBody *body, Contact *c, RigidBody *other, float 
  *
  * Order matters — update velocity before position (semi-implicit):
  *   1. vel += GRAVITY * dt               (apply gravitational acceleration)
- *   2. vel *= LINEAR_DAMPING             (energy dissipation)
+ *      Equivalent to: b->vel = v3_add(b->vel, v3_scale(GRAVITY, dt));
+ *
+ *   2. vel *= LINEAR_DAMPING             (energy dissipation each frame)
+ *      b->vel = v3_scale(b->vel, LINEAR_DAMPING);
+ *      LINEAR_DAMPING < 1.0 slowly bleeds kinetic energy, simulating
+ *      air resistance without needing an explicit drag force.
+ *
  *   3. angular_vel *= ANGULAR_DAMPING
- *   4. pos += vel * dt                   (update position)
+ *      Same idea for rotational motion.
+ *
+ *   4. pos += vel * dt                   (update position with NEW velocity)
+ *      b->pos = v3_add(b->pos, v3_scale(b->vel, dt));
+ *      Using the just-updated vel makes this semi-implicit (symplectic),
+ *      which conserves energy better than explicit Euler.
+ *
  *   5. Update orientation from angular_vel:
- *        angle = length(angular_vel) * dt
- *        if angle > EPSILON:
- *          axis = normalize(angular_vel)
- *          dq   = q_from_axis_angle(axis, angle)
- *          b->orientation = q_norm(q_mul(dq, b->orientation))
+ *        float angle = v3_len(b->angular_vel) * dt;
+ *        if (angle > EPSILON) {
+ *            vec3 axis = v3_norm(b->angular_vel);
+ *            quat dq   = q_from_axis_angle(axis, angle);
+ *            b->orientation = q_norm(q_mul(dq, b->orientation));
+ *        }
+ *      q_norm prevents quaternion length drift due to floating-point errors.
  * ══════════════════════════════════════════════════════════════════ */
 static void integrate_body(RigidBody *b, float dt) {
     /* TODO: Semi-implicit Euler integration
@@ -426,19 +514,25 @@ static void integrate_body(RigidBody *b, float dt) {
  * TODO #4: Main physics step
  *
  * Called every frame at a fixed timestep (1/60 s).
+ * A fixed dt (rather than the variable render dt) makes physics
+ * deterministic and independent of frame rate.
  *
  * Steps:
  *   1. Integrate each active body: integrate_body(&bodies[i], dt)
+ *      This advances velocities and positions by one timestep.
  *
  *   2. Ground collisions — for each active body:
  *        if SHAPE_SPHERE: c = collide_sphere_ground(&bodies[i])
  *        if SHAPE_BOX:    c = collide_box_ground(&bodies[i])
  *        resolve_collision(&bodies[i], &c, NULL)   // NULL = static ground
+ *      NULL for `other` tells resolve_collision the ground has infinite mass
+ *      (inv_mass = 0), so only the dynamic body receives velocity changes.
  *
  *   3. Sphere-sphere collisions — for each pair (i < j), both active:
  *        if both SHAPE_SPHERE:
  *          c = collide_sphere_sphere(&bodies[i], &bodies[j])
  *          if (c.collided): resolve_collision(&bodies[i], &c, &bodies[j])
+ *      Only sphere-sphere is tested here; sphere-box is an optional extension.
  * ══════════════════════════════════════════════════════════════════ */
 static void physics_step(float dt) {
     /* TODO: Integrate, then resolve ground and sphere-sphere collisions */

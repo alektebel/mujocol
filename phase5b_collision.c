@@ -12,6 +12,52 @@
  * - Implement box-ground collision by testing all 8 corners
  * - Implement sphere-sphere collision using distance comparison
  * - Understand Contact struct: point, normal, penetration depth
+ *
+ * TECHNIQUE OVERVIEW:
+ *
+ * 1. CONTACT STRUCT
+ *    When two bodies overlap we record everything the response solver needs:
+ *      point      — world-space position of the collision (used to compute the
+ *                   moment arm for angular impulse: r = point - body->pos).
+ *      normal     — unit vector pointing FROM body B TOWARD body A.  Applying
+ *                   an impulse along +normal pushes A away from B.
+ *      penetration — how far the shapes overlap (depth > 0).  Used by
+ *                   Baumgarte stabilization to correct drifting positions.
+ *    The `collided` flag (1 / 0) lets callers skip response when no overlap.
+ *
+ * 2. SPHERE–GROUND COLLISION
+ *    Ground is the infinite plane y = GROUND_Y with upward normal (0,1,0).
+ *    A sphere at pos with radius r overlaps when:
+ *      dist = pos.y - GROUND_Y - r  <  0
+ *    penetration = -dist  (= r - (pos.y - GROUND_Y), always positive)
+ *    contact point = (pos.x, GROUND_Y, pos.z)  — sphere's lowest point
+ *                    projected onto the ground plane.
+ *
+ * 3. BOX–GROUND COLLISION
+ *    A box has 8 corners.  After rotating each corner from body-local space
+ *    to world space (using q_rotate), any corner with world.y < GROUND_Y is
+ *    below the ground.  We take the deepest corner as the single contact:
+ *      penetration = GROUND_Y - min_y
+ *      contact point = that corner (the actual geometry intersection point).
+ *    This "single deepest corner" approximation is cheap and stable for demos;
+ *    a production engine would use all penetrating corners (multi-contact).
+ *
+ * 4. SPHERE–SPHERE COLLISION
+ *    Two spheres of radii r1, r2 centred at p1, p2 overlap when:
+ *      dist < r1 + r2   (and dist > EPSILON to avoid divide-by-zero)
+ *    penetration = (r1 + r2) - dist
+ *    normal      = normalize(p2 - p1)   — points from sphere 1 toward sphere 2
+ *    contact point = p1 + normal * r1   — surface of sphere 1 along the normal
+ *    Note the convention here: normal points FROM a TO b (body b pushes body a
+ *    in the +normal direction during response).
+ *
+ * 5. RETURN CONVENTION: 0 / 1
+ *    Each detection function returns a Contact struct.  The `collided` field
+ *    acts as the boolean return value:
+ *      0 — no overlap, caller skips response entirely.
+ *      1 — overlap detected, Contact fields are valid.
+ *    This avoids a separate boolean parameter while keeping the geometry data
+ *    and the collision flag together in one struct.
  */
 
 #include <stdio.h>
@@ -156,11 +202,25 @@ typedef struct {
  * A sphere at position b->pos with radius r overlaps the ground when:
  *   dist = b->pos.y - GROUND_Y - radius  < 0
  *
+ * dist is the signed gap between the sphere's bottom and the ground:
+ *   > 0  →  no contact (sphere is above ground)
+ *   = 0  →  just touching (no penetration, no impulse needed)
+ *   < 0  →  overlap, penetration = -dist
+ *
  * If colliding:
  *   c.collided    = 1
  *   c.normal      = (0, 1, 0)                   [pointing up into the body]
  *   c.penetration = -dist                        [positive overlap amount]
  *   c.point       = (b->pos.x, GROUND_Y, b->pos.z)
+ *
+ * Implementation:
+ *   float dist = b->pos.y - GROUND_Y - b->shape.radius;
+ *   if (dist < 0) {
+ *       c.collided    = 1;
+ *       c.normal      = v3(0, 1, 0);
+ *       c.penetration = -dist;
+ *       c.point       = v3(b->pos.x, GROUND_Y, b->pos.z);
+ *   }
  * ══════════════════════════════════════════════════════════════════ */
 static Contact collide_sphere_ground(RigidBody *b) {
     Contact c = {0};
@@ -178,12 +238,24 @@ static Contact collide_sphere_ground(RigidBody *b) {
  *   local = (i * he.x,  j * he.y,  k * he.z)
  *   world = b->pos + q_rotate(b->orientation, local)
  *
+ * q_rotate transforms the corner from body-local space (where the box
+ * is axis-aligned) into world space (where it may be rotated).
+ *
  * Track the corner with the minimum world.y (deepest below ground).
  * If min_y < GROUND_Y:
  *   c.collided    = 1
  *   c.normal      = (0, 1, 0)
  *   c.penetration = GROUND_Y - min_y
  *   c.point       = that deepest corner
+ *
+ * Implementation outline:
+ *   int signs[2] = {-1, 1};
+ *   float min_y = 1e10f;  vec3 min_pt = v3(0,0,0);
+ *   for each (i,j,k) combination:
+ *     vec3 local = v3(signs[i]*he.x, signs[j]*he.y, signs[k]*he.z);
+ *     vec3 world = v3_add(b->pos, q_rotate(b->orientation, local));
+ *     if (world.y < min_y) { min_y = world.y; min_pt = world; }
+ *   if (min_y < GROUND_Y) { fill c... }
  * ══════════════════════════════════════════════════════════════════ */
 static Contact collide_box_ground(RigidBody *b) {
     Contact c = {0};
@@ -201,10 +273,28 @@ static Contact collide_box_ground(RigidBody *b) {
  *   min_dist = a->shape.radius + b->shape.radius
  *   dist < min_dist  AND  dist > EPSILON  (avoids divide-by-zero)
  *
+ * The EPSILON guard is essential: if two sphere centres coincide,
+ * normalization would divide by zero.  In practice this means the
+ * normal vector is (b->pos - a->pos) / dist — only valid when dist > 0.
+ *
  * If colliding:
  *   c.normal      = (b->pos - a->pos) / dist    [unit vector from a → b]
  *   c.penetration = min_dist - dist
  *   c.point       = a->pos + normal * a->shape.radius
+ *                   (surface of sphere A along the collision normal)
+ *
+ * Returns 1 (c.collided=1) if overlap, 0 otherwise.
+ *
+ * Implementation:
+ *   vec3 diff = v3_sub(b->pos, a->pos);
+ *   float dist = v3_len(diff);
+ *   float min_dist = a->shape.radius + b->shape.radius;
+ *   if (dist < min_dist && dist > EPSILON) {
+ *       c.collided    = 1;
+ *       c.normal      = v3_scale(diff, 1.0f / dist);
+ *       c.penetration = min_dist - dist;
+ *       c.point       = v3_add(a->pos, v3_scale(c.normal, a->shape.radius));
+ *   }
  * ══════════════════════════════════════════════════════════════════ */
 static Contact collide_sphere_sphere(RigidBody *a, RigidBody *b) {
     Contact c = {0};
@@ -218,17 +308,24 @@ static Contact collide_sphere_sphere(RigidBody *a, RigidBody *b) {
  *
  * Simplified version — ignores box rotation (treats box as axis-aligned).
  * Steps:
- *   1. Compute the sphere center relative to the box center
- *   2. Clamp each component to [-he.x, he.x], [-he.y, he.y], [-he.z, he.z]
- *      to find the closest point on (or inside) the AABB
- *   3. Compute distance from sphere center to that closest point
- *   4. If distance < sphere radius → collision
- *      normal = normalize(sphere_pos - closest_point)
- *      penetration = sphere_radius - distance
- *      point = closest_point (in world space)
+ *   1. Compute the sphere center relative to the box center:
+ *        local = sphere->pos - box->pos
+ *   2. Clamp each component of `local` to [-he.x, he.x] etc. to find
+ *      the closest point ON THE SURFACE OR INSIDE the AABB:
+ *        closest.x = clamp(local.x, -he.x, he.x)
+ *        closest.y = clamp(local.y, -he.y, he.y)
+ *        closest.z = clamp(local.z, -he.z, he.z)
+ *      (closest is in box-local space; add box->pos for world space)
+ *   3. Compute distance from sphere center to that closest point:
+ *        diff = sphere->pos - (box->pos + closest)
+ *        dist = length(diff)
+ *   4. If dist < sphere->shape.radius → collision:
+ *        normal      = normalize(sphere->pos - closest_world)
+ *        penetration = sphere->shape.radius - dist
+ *        point       = closest_world   (on the box surface)
  *
  * NOTE: For the full rotated-box version you would transform the sphere
- *       into box-local space first.
+ *       into box-local space first (multiply by inverse orientation).
  * ══════════════════════════════════════════════════════════════════ */
 static Contact collide_sphere_box(RigidBody *sphere, RigidBody *box) {
     Contact c = {0};
@@ -247,6 +344,22 @@ static Contact collide_sphere_box(RigidBody *sphere, RigidBody *box) {
  * If no collisions found, return Contact with collided = 0.
  *
  * Useful for debugging — lets you confirm the worst collision first.
+ * In a full engine you would resolve ALL contacts each step; this
+ * function is a diagnostic utility that returns only the worst one.
+ *
+ * Implementation outline:
+ *   Contact worst = {0};
+ *   for (int i = 0; i < n; i++) {
+ *     if (!bodies[i].active) continue;
+ *     for (int j = i+1; j < n; j++) {
+ *       if (!bodies[j].active) continue;
+ *       Contact c;
+ *       if (both SHAPE_SPHERE)              c = collide_sphere_sphere(&bodies[i], &bodies[j]);
+ *       else if (one SPHERE, one BOX)       c = collide_sphere_box(sphere_ptr, box_ptr);
+ *       if (c.collided && c.penetration > worst.penetration) worst = c;
+ *     }
+ *   }
+ *   return worst;
  * ══════════════════════════════════════════════════════════════════ */
 static Contact find_deepest_penetration(RigidBody *bodies, int n) {
     Contact worst = {0};

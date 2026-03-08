@@ -15,6 +15,64 @@
  * - Use clock_gettime(CLOCK_MONOTONIC) for precise timing
  * - Use nanosleep() for frame rate control
  * - Animate objects using dt-based physics
+ *
+ * ── TECHNIQUE OVERVIEW ──────────────────────────────────────────────
+ *
+ * 1. poll() FOR NON-BLOCKING I/O
+ *    We need to check for keyboard input without halting the animation.
+ *    read() with VMIN=0 does return immediately when no data is present,
+ *    but poll() is the cleaner, more portable POSIX approach: it lets
+ *    you query multiple file descriptors at once and express intent
+ *    explicitly.  Key fields of struct pollfd:
+ *      fd      — which file descriptor to watch (STDIN_FILENO here)
+ *      events  — what we want to know: POLLIN means "data is readable"
+ *      revents — filled in by poll() with what actually happened
+ *    Passing timeout=0 makes poll() return instantly (pure polling, no
+ *    blocking), which is exactly what a real-time game loop needs.
+ *
+ * 2. CLOCK_MONOTONIC
+ *    Two clock sources are available in POSIX:
+ *      CLOCK_REALTIME  — wall-clock time; can jump forward or backward
+ *                        when NTP adjusts the system clock.
+ *      CLOCK_MONOTONIC — guaranteed to never go backwards; ticks
+ *                        continuously from some arbitrary epoch.
+ *    For measuring frame intervals (dt) we must use CLOCK_MONOTONIC.
+ *    If CLOCK_REALTIME jumped back by 1 second we would get a negative
+ *    dt and the physics would run in reverse.
+ *
+ * 3. nanosleep()
+ *    POSIX function to sleep for a precise duration.  The argument is a
+ *    struct timespec with two fields:
+ *      tv_sec  — whole seconds
+ *      tv_nsec — remaining nanoseconds (must be in range 0-999999999)
+ *    We sleep at the end of each frame to cap CPU usage; the animation
+ *    loop targets ~60 fps (16 ms per frame).
+ *
+ * 4. dt-BASED PHYSICS
+ *    Rather than moving a ball by a fixed number of pixels per frame, we
+ *    multiply velocity by dt (elapsed time in seconds):
+ *      x += vx * dt
+ *    This makes motion frame-rate independent: a ball with vx = 30
+ *    cells/sec travels exactly 30 cells per second whether the loop
+ *    runs at 30 fps (dt ≈ 0.033) or 120 fps (dt ≈ 0.008).
+ *
+ * 5. volatile sig_atomic_t
+ *    Signal handlers run asynchronously — they can interrupt any
+ *    instruction.  A plain int shared between the main loop and a
+ *    signal handler could be read mid-write on some architectures.
+ *    sig_atomic_t is an integer type whose reads and writes are
+ *    guaranteed atomic with respect to signal delivery.  The volatile
+ *    qualifier tells the compiler to never cache the value in a
+ *    register: every read must go to memory, ensuring the main loop
+ *    sees updates written by the signal handler immediately.
+ *
+ * 6. SIGWINCH
+ *    The kernel sends SIGWINCH ("window changed") to a process whenever
+ *    the terminal window is resized.  We install a handler that sets
+ *    got_resize = 1, then check that flag at the top of each frame loop
+ *    iteration.  When set, we re-query the terminal dimensions with
+ *    get_term_size() (ioctl/TIOCGWINSZ, explained in phase1a) and
+ *    reallocate the cell buffers to match the new size.
  */
 
 #define _POSIX_C_SOURCE 199309L
@@ -27,7 +85,7 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <time.h>
-#include <poll.h>
+#include <poll.h>      /* struct pollfd, poll() — non-blocking I/O readiness */
 #include <math.h>
 #include <signal.h>
 
@@ -207,6 +265,28 @@ static void draw_border(void) {
  *
  * Hint: struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
  *       poll(&pfd, 1, 0);
+ *
+ * struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 }  — field by field:
+ *   fd      = STDIN_FILENO : watch standard input
+ *   events  = POLLIN       : we want to know when data can be read
+ *   revents = 0            : output field, initialized to 0 by us
+ *
+ * poll(&pfd, 1, 0) arguments:
+ *   &pfd   — pointer to the array of pollfd structs
+ *   1      — number of structs in the array (we only watch one fd)
+ *   0      — timeout in milliseconds; 0 = return immediately
+ *
+ * ARROW KEY SEQUENCES:
+ *   Terminals encode arrow keys as multi-byte ANSI escape sequences:
+ *     Up    → ESC '[' 'A'   (3 bytes)
+ *     Down  → ESC '[' 'B'
+ *     Right → ESC '[' 'C'
+ *     Left  → ESC '[' 'D'
+ *   We first read one byte and check whether it is ESC (0x1B / '\033').
+ *   If so, we poll() once more to see if there is a continuation; if
+ *   yes, we read the '[' and the letter.  Using poll() for the follow-up
+ *   read prevents blocking if the user pressed a bare ESC key with no
+ *   subsequent bytes.
  * ══════════════════════════════════════════════════════════════════ */
 static int read_key(void) {
     /* TODO: Non-blocking keyboard input with arrow-key parsing */
@@ -219,6 +299,13 @@ static int read_key(void) {
  * Return the current wall-clock time as a double (seconds) using
  * clock_gettime(CLOCK_MONOTONIC, &ts).
  * Formula: ts.tv_sec + ts.tv_nsec * 1e-9
+ *
+ * clock_gettime(CLOCK_MONOTONIC, &ts) fills the struct timespec ts:
+ *   tv_sec  — whole seconds since the monotonic clock's epoch
+ *   tv_nsec — additional nanoseconds (0 … 999999999)
+ * Combining them: ts.tv_sec + ts.tv_nsec * 1e-9 gives a single double
+ * in seconds with nanosecond precision.  We use CLOCK_MONOTONIC (not
+ * CLOCK_REALTIME) so the value never jumps — see the TECHNIQUE OVERVIEW.
  * ══════════════════════════════════════════════════════════════════ */
 static double get_time(void) {
     /* TODO: Return monotonic time in seconds */
@@ -232,6 +319,17 @@ static double get_time(void) {
  * Assumes ms >= 0.
  * struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
  * nanosleep(&ts, NULL);
+ *
+ * BREAKING DOWN THE TIMESPEC INITIALIZER:
+ *   ms / 1000          — integer division gives the whole-second part.
+ *                        e.g. 2500 ms → tv_sec = 2
+ *   (ms % 1000) * 1000000L — the leftover milliseconds converted to
+ *                        nanoseconds (1 ms = 1,000,000 ns).
+ *                        e.g. 2500 ms → (2500 % 1000) * 1000000L
+ *                             = 500 * 1000000L = 500000000 ns
+ * The L suffix on 1000000L promotes the literal to long before the
+ * multiplication, preventing integer overflow on platforms where int is
+ * 16 bits (where 999 * 1000000 = 999000000 > 32767 = INT_MAX).
  * ══════════════════════════════════════════════════════════════════ */
 static void sleep_ms(int ms) {
     /* TODO: Sleep using nanosleep() */
@@ -265,6 +363,16 @@ static int  num_balls = 5;
  *
  * Using fabs() for the bounce ensures the velocity is always directed
  * away from the wall even if multiple frames are skipped.
+ *
+ * WHY fabs() INSTEAD OF JUST NEGATING?
+ *   A naive bounce: vx = -vx.  This can fail when a ball penetrates the
+ *   wall by more than one frame's worth of movement (e.g. after a
+ *   resize or a hiccup in frame timing): the ball oscillates inside the
+ *   wall, toggling direction each frame and never escaping.
+ *   Using fabs() is a one-sided clamp: after hitting the left wall we
+ *   set vx = +|vx|, which is always positive (pointing right) regardless
+ *   of what vx was before.  The ball is guaranteed to move away from the
+ *   wall on the very next frame.
  * ══════════════════════════════════════════════════════════════════ */
 static void update_balls(float dt) {
     /* TODO: Advance positions and bounce off borders */
@@ -284,6 +392,19 @@ static void update_balls(float dt) {
  *   |vy|     : 5  … 25  (randomly negate half of them)
  *   color    : 196 + (i * 30) % 60   (bright spectrum)
  *   ch       : pick from "@O*o.#$&"
+ *
+ * THE rand()%(range)+base PATTERN:
+ *   rand() returns a pseudo-random int in [0, RAND_MAX].
+ *   rand() % range maps it to [0, range-1].
+ *   Adding base shifts it to [base, base+range-1].
+ *   Example: rand() % 30 + 10 gives a value in [10, 39].
+ *   To randomly negate a velocity: if (rand() % 2) vx = -vx;
+ *
+ * ARRAY POPULATION:
+ *   Loop i from 0 to MAX_BALLS-1 and fill balls[i].  All MAX_BALLS
+ *   entries are initialized even though only num_balls are active;
+ *   this allows the user to enable more balls at runtime ('+' key)
+ *   without reinitialising them on the fly.
  * ══════════════════════════════════════════════════════════════════ */
 static void init_balls(void) {
     /* TODO: Randomize ball starting state */

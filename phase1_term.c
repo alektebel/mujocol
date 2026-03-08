@@ -107,7 +107,7 @@ static void disable_raw_mode(void) {
     if (raw_mode_enabled) {
 	write(STDOUT_FILENO, "\033[?25h\033[0m\033[2J\033[H", 18);
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-        raw_mode_enabled = 0;/
+        raw_mode_enabled = 0;
         (void)orig_termios; /* remove when implemented */
     }
 }

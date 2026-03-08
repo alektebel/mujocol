@@ -14,6 +14,60 @@
  *     Box:    I = mass * (w^2 + h^2 + d^2) / 12
  * - Understand why we store inv_mass and inv_inertia (multiplication is faster than division)
  * - Handle static bodies (mass = 0) with inv_mass = 0
+ *
+ * TECHNIQUE OVERVIEW:
+ *
+ * 1. RIGID BODY STATE
+ *    A rigid body in 3D needs six degrees of freedom to fully describe its
+ *    motion.  We track these as two groups of state:
+ *      - Linear:  pos (vec3, world-space position of center of mass)
+ *                 vel (vec3, linear velocity in m/s)
+ *      - Angular: orientation (quat, rotation from body-local to world frame)
+ *                 angular_vel (vec3, angular velocity in radians/second)
+ *    The direction of angular_vel is the instantaneous rotation axis; its
+ *    magnitude is how fast the body spins.  Quaternions avoid gimbal lock
+ *    (covered in phase 2c — not repeated here).
+ *
+ * 2. MOMENT OF INERTIA
+ *    Mass tells us how hard it is to change linear velocity.  The moment of
+ *    inertia I tells us how hard it is to change angular velocity — it is the
+ *    rotational equivalent of mass.  I depends on BOTH the mass distribution
+ *    AND the geometry:
+ *      Solid sphere (mass m, radius r):     I = (2/5) * m * r²
+ *      Solid box (mass m, dims w × h × d):  I_x = m*(h²+d²)/12
+ *                                            I_y = m*(w²+d²)/12
+ *                                            I_z = m*(w²+h²)/12
+ *    Larger or more spread-out objects have larger I and resist spinning more.
+ *
+ * 3. INERTIA TENSOR
+ *    In 3D the moment of inertia is really a 3×3 matrix because resistance to
+ *    rotation varies with the axis of rotation.  For symmetric shapes
+ *    (sphere, axis-aligned box) the off-diagonal terms are zero, so the tensor
+ *    is diagonal — we only need to store three values (Ixx, Iyy, Izz).
+ *    This file uses a scalar simplification (one combined I) suitable for the
+ *    demo; a full simulator would store a vec3 diagonal or full mat3.
+ *
+ * 4. WHY STORE inv_mass AND inv_inertia?
+ *    Every physics step we compute:
+ *      linear acceleration:  a = F / m   = F * inv_mass
+ *      angular acceleration: α = τ / I   = τ * inv_inertia
+ *    Floating-point division is ~4–20× slower than multiplication on modern
+ *    CPUs (including aarch64/Apple Silicon).  Pre-computing 1/m and 1/I means
+ *    every integration step only needs fast multiplications.
+ *
+ * 5. STATIC BODIES (mass = 0)
+ *    Setting inv_mass = 0 makes a body "infinitely heavy" — no impulse can
+ *    move it.  Ground planes and walls are static.  In the impulse formula,
+ *    any term multiplied by inv_mass_A or inv_mass_B simply evaluates to zero,
+ *    so the code naturally skips applying velocity changes to static bodies.
+ *
+ * 6. ShapeType ENUM
+ *    SHAPE_SPHERE and SHAPE_BOX select:
+ *      - Which SDF primitive to evaluate during ray marching (phase 3).
+ *      - Which inertia formula to use during body_init.
+ *      - Which collision geometry to test in phase 5b.
+ *    The enum is stored alongside the shape parameters (radius / half_extents)
+ *    in the Shape sub-struct of RigidBody.
  */
 
 #include <stdio.h>
@@ -87,6 +141,20 @@ typedef struct {
  *   I = (2/5) * mass * radius^2  =  0.4 * mass * radius * radius
  * Store both inertia and its inverse (1/inertia).
  * If mass == 0 (static body), inv_mass = inv_inertia = 0.
+ *
+ * Implementation steps:
+ *   b->pos         = pos;
+ *   b->vel         = v3(0,0,0);        // starts at rest
+ *   b->angular_vel = v3(0,0,0);        // no initial spin
+ *   b->orientation = q_identity();     // identity = no rotation
+ *   b->mass        = mass;
+ *   b->inertia     = 0.4f * mass * radius * radius;   // sphere formula
+ *   b->inv_mass    = (mass    > 0) ? 1.0f / mass    : 0.0f;
+ *   b->inv_inertia = (inertia > 0) ? 1.0f / inertia : 0.0f;
+ *   b->shape.type   = SHAPE_SPHERE;
+ *   b->shape.radius = radius;
+ *   b->color_id    = color_id;
+ *   b->active      = 1;
  * ══════════════════════════════════════════════════════════════════ */
 static void body_init_sphere(RigidBody *b, vec3 pos, float radius,
                               float mass, int color_id) {
@@ -110,6 +178,19 @@ static void body_init_sphere(RigidBody *b, vec3 pos, float radius,
  *   w = 2 * half_ext.x,  h = 2 * half_ext.y,  d = 2 * half_ext.z
  * The scalar moment of inertia is:
  *   I = mass * (w^2 + h^2 + d^2) / 12
+ *
+ * This is an isotropic simplification: a real box has a different I around
+ * each axis (I_x, I_y, I_z), but for the demo we average them into one
+ * scalar that captures the overall rotational inertia.
+ *
+ * Implementation:
+ *   float w = 2.0f * half_ext.x;
+ *   float h = 2.0f * half_ext.y;
+ *   float d = 2.0f * half_ext.z;
+ *   b->inertia = mass * (w*w + h*h + d*d) / 12.0f;
+ *   b->shape.type          = SHAPE_BOX;
+ *   b->shape.half_extents  = half_ext;
+ *   (rest is identical to sphere init — same pos/vel/orientation/inv_mass pattern)
  * ══════════════════════════════════════════════════════════════════ */
 static void body_init_box(RigidBody *b, vec3 pos, vec3 half_ext,
                            float mass, int color_id) {
@@ -130,6 +211,15 @@ static void body_init_box(RigidBody *b, vec3 pos, vec3 half_ext,
  * Example output:
  *   [MySphere] pos=(0.00, 5.00, 0.00) vel=(0.00, 0.00, 0.00)
  *              mass=1.00 inertia=0.10 inv_mass=1.00 inv_inertia=10.00
+ *
+ * Implementation hint:
+ *   printf("[%s] pos=(%.2f, %.2f, %.2f) vel=(%.2f, %.2f, %.2f)\n",
+ *          label, b->pos.x, b->pos.y, b->pos.z,
+ *          b->vel.x, b->vel.y, b->vel.z);
+ *   printf("     mass=%.2f inertia=%.4f inv_mass=%.4f inv_inertia=%.4f\n",
+ *          b->mass, b->inertia, b->inv_mass, b->inv_inertia);
+ *   Use a ternary to print shape type:
+ *     (b->shape.type == SHAPE_SPHERE) ? "sphere" : "box"
  * ══════════════════════════════════════════════════════════════════ */
 static void body_print(const RigidBody *b, const char *label) {
     /* TODO: Print body state using printf
@@ -145,7 +235,11 @@ static void body_print(const RigidBody *b, const char *label) {
  * Newton's second law: F = m * a  =>  a = F / m = F * inv_mass
  * Semi-implicit: accumulate velocity change directly:
  *   vel += force * inv_mass * dt
- * Static bodies (inv_mass == 0) are not affected.
+ * Static bodies (inv_mass == 0) are not affected because any term
+ * scaled by inv_mass=0 evaluates to zero — no special branch needed.
+ *
+ * Implementation (one line):
+ *   b->vel = v3_add(b->vel, v3_scale(force, b->inv_mass * dt));
  * ══════════════════════════════════════════════════════════════════ */
 static void body_apply_force(RigidBody *b, vec3 force, float dt) {
     /* TODO: b->vel += force * b->inv_mass * dt
@@ -158,7 +252,14 @@ static void body_apply_force(RigidBody *b, vec3 force, float dt) {
  *
  * Angular analogue of force application:
  *   angular_vel += torque * inv_inertia * dt
- * Static bodies (inv_inertia == 0) are not affected.
+ * Static bodies (inv_inertia == 0) are not affected — same reason as
+ * inv_mass: the scale factor is zero so the update is a no-op.
+ * Torque is a vec3 whose direction is the rotation axis (right-hand rule)
+ * and whose magnitude is Newton·metres.
+ *
+ * Implementation (one line, identical structure to body_apply_force):
+ *   b->angular_vel = v3_add(b->angular_vel,
+ *                           v3_scale(torque, b->inv_inertia * dt));
  * ══════════════════════════════════════════════════════════════════ */
 static void body_apply_torque(RigidBody *b, vec3 torque, float dt) {
     /* TODO: b->angular_vel += torque * b->inv_inertia * dt

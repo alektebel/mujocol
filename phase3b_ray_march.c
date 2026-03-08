@@ -14,6 +14,39 @@
  * - Combine multiple SDF primitives into a scene using union
  */
 
+/* ══════════════════════════════════════════════════════════════════
+ * TECHNIQUE OVERVIEW
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * 1. Sphere tracing
+ *    The algorithm: start from ray origin, evaluate d = scene_sdf(pos).
+ *    Since d is the guaranteed safe step size (the nearest surface is
+ *    at least d units away), advance pos += dir * d.  Repeat until
+ *    d < epsilon (hit) or total distance > MAX_DIST (miss).  Never
+ *    overshoots a surface.
+ *
+ * 2. Camera ray generation
+ *    For a raster image, each pixel (px, py) maps to a normalized
+ *    screen-space coordinate UV in [-aspect/2..aspect/2] × [-0.5..0.5].
+ *    The ray direction is:
+ *      normalize(right*u + up*v - forward*focal_length)
+ *    where the camera's forward/right/up vectors come from the
+ *    look-at matrix.
+ *
+ * 3. Aspect ratio correction
+ *    Terminal characters are taller than they are wide (typically ~2:1
+ *    ratio).  We correct by scaling the horizontal UV by
+ *    `aspect = term_w / term_h / 2.0f` (divide by 2 accounts for
+ *    character aspect ratio).
+ *
+ * 4. 1e10f return / MAX_DIST
+ *    The ray marcher has two stopping conditions:
+ *    (a) d < HIT_EPS  = surface hit;
+ *    (b) total_dist > MAX_DIST = miss (ray escaped the scene).
+ *    Returning 1e10f from scene sdf means "nothing here" and the
+ *    marcher immediately exceeds MAX_DIST.
+ * ══════════════════════════════════════════════════════════════════ */
+
 #define _POSIX_C_SOURCE 199309L
 #define _DEFAULT_SOURCE
 #include <stdio.h>
@@ -206,7 +239,17 @@ typedef struct {
  * ══════════════════════════════════════════════════════════════════ */
 static SceneHit scene_sdf(vec3 p) {
     SceneHit hit = {1e10f, 0};
-    /* TODO: Build the scene — add plane, sphere, box, and torus */
+    /* TODO: Build the scene — add plane, sphere, box, and torus
+     * Build the scene by computing the SDF of each primitive and taking
+     * the union (minimum) of all distances.  The plane provides a
+     * ground; the sphere, box, and torus demonstrate the three primitive
+     * types from phase3a.  Return the minimum:
+     *   float d = sdf_plane(...);
+     *   d = fminf(d, sdf_sphere(...));
+     *   d = fminf(d, sdf_box(...));
+     *   d = fminf(d, sdf_torus(...));
+     *   return d;
+     */
     (void)p;
     return hit;
 }
@@ -238,7 +281,21 @@ typedef struct {
  * ══════════════════════════════════════════════════════════════════ */
 static RayResult ray_march(vec3 ro, vec3 rd) {
     RayResult result = {0, 0.0f, ro, 0};
-    /* TODO: Implement the ray marching loop */
+    /* TODO: Implement the ray marching loop
+     * The loop:
+     *   float t = 0;
+     *   for(int i=0; i<MAX_STEPS; i++) {
+     *       float d = scene_dist(v3_add(ro, v3_scale(rd, t)));
+     *       if(d < HIT_EPS) return t;
+     *       t += d;
+     *       if(t > MAX_DIST) break;
+     *   }
+     *   return MAX_DIST;
+     * ro=ray_origin, rd=ray_direction (unit vector).  Advancing by d
+     * each step is the sphere-tracing guarantee: d is the minimum
+     * distance to any surface in the scene, so we can always safely
+     * step that far.
+     */
     (void)ro; (void)rd;
     return result;
 }
@@ -270,7 +327,19 @@ typedef struct {
  * Hint: use v3_norm(), v3_cross(), v3_add(), v3_scale()
  * ══════════════════════════════════════════════════════════════════ */
 static void camera_get_ray(Camera *cam, float u, float v, vec3 *ro, vec3 *rd) {
-    /* TODO: Compute ray origin and direction from camera parameters */
+    /* TODO: Compute ray origin and direction from camera parameters
+     * Steps:
+     * (1) Compute the camera basis:
+     *     `forward = normalize(target-eye)`
+     *     `right   = normalize(cross(forward, world_up))`
+     *     `up      = cross(right, forward)`
+     * (2) Compute NDC (Normalized Device Coordinates):
+     *     `uv_x = (px / width  - 0.5f) * aspect * 2.0f`
+     *     `uv_y = -(py / height - 0.5f)` (negate y because screen y
+     *     increases downward but 3D y increases upward)
+     * (3) Ray direction:
+     *     `normalize(right*uv_x + up*uv_y + forward*focal_len)`
+     */
     (void)cam; (void)u; (void)v;
     *ro = cam->pos;
     *rd = v3(0, 0, -1);  /* placeholder — always points toward -Z */
@@ -296,7 +365,14 @@ static void camera_get_ray(Camera *cam, float u, float v, vec3 *ro, vec3 *rd) {
  * ══════════════════════════════════════════════════════════════════ */
 static void render_frame(Camera *cam) {
     float aspect = (float)term_w / (term_h * 2.0f);
-    /* TODO: Iterate over every pixel, compute UV, get ray, march, colour */
+    /* TODO: Iterate over every pixel, compute UV, get ray, march, colour
+     * For each row y, col x: call `camera_ray(x, y)` to get (ro, rd),
+     * then `t = ray_march(ro, rd)`.  If t >= MAX_DIST, the pixel is
+     * background (draw space character).  Otherwise the ray hit a
+     * surface — for now pick a character from the ASCII density ramp
+     * based on a simple shading (e.g. based on hit distance).  Use
+     * `set_cell(x, y, ch, fg, bg)` to write the pixel.
+     */
     (void)cam; (void)aspect;
     for (int y = 0; y < term_h; y++)
         for (int x = 0; x < term_w; x++)

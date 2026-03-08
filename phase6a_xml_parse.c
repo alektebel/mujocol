@@ -12,6 +12,47 @@
  * - Extract attribute name=value pairs from XML tags
  * - Handle XML whitespace, comments, and self-closing tags
  * - Test your parser by printing all link names and joint names from a URDF
+ *
+ * ──────────────────────────────────────────────────────────────────
+ * TECHNIQUE OVERVIEW
+ * ──────────────────────────────────────────────────────────────────
+ *
+ * 1. XML STRUCTURE BASICS
+ *    XML uses angle-bracket tags: <link name="base"> opens a tag and
+ *    </link> closes it.  Tags can be self-closing: <origin xyz="0 0 0"/>.
+ *    Attributes are key="value" pairs inside the opening tag.
+ *    URDF (Unified Robot Description Format) is an XML-based format for
+ *    describing robot geometry and kinematics.
+ *
+ * 2. WHY NO XML LIBRARY?
+ *    We parse manually with a char *ptr scanning through the file buffer.
+ *    This avoids external dependencies and teaches you how parsers work at
+ *    the character level.  The cost: it is fragile with unusual XML (e.g.
+ *    quoted attributes containing angle brackets).  For a physics engine
+ *    tutorial, hand-rolled is fine.
+ *
+ * 3. CHARACTER-BY-CHARACTER PARSING TECHNIQUE
+ *    The core pattern: advance xml_ptr forward while checking conditions.
+ *      skip_whitespace()      — advances past spaces, tabs, newlines.
+ *      skip_comment()         — advances past <!-- ... --> blocks.
+ *      skip_to_tag_end()      — advances to the closing '>'.
+ *    When we encounter '<', a tag is starting; we scan forward to read
+ *    the tag name, then scan attribute name=value pairs one at a time.
+ *
+ * 4. TAG NAME EXTRACTION
+ *    After consuming '<', scan forward stopping at whitespace, '>' or '/'
+ *    to read the tag name into a fixed-size buffer.  The name ends at the
+ *    first non-identifier character.  strncmp() is used to check whether
+ *    we are inside a <link> or <joint> element.
+ *
+ * 5. ATTRIBUTE EXTRACTION
+ *    After the tag name, repeatedly:
+ *      a. skip whitespace.
+ *      b. Read identifier characters → key name, stopping at '='.
+ *      c. Skip '=' and the opening quote character ('"' or '\'').
+ *      d. Read value characters until the matching closing quote.
+ *    This yields key-value pairs.  atof() / sscanf() convert strings to
+ *    numbers (see parse_float() and parse_vec3() below).
  */
 
 #define _POSIX_C_SOURCE 199309L
@@ -88,22 +129,31 @@ static float parse_float(const char *s) {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #1: parse_tag_name — scan the next XML tag name from xml_ptr
  *
+ * xml_ptr starts somewhere in the middle of the XML text.  Advance it
+ * forward until we land on '<', then extract the tag name that follows.
+ *
  * Algorithm:
  *   1. Loop: skip_whitespace(), then skip_comment().
  *      Repeat while *xml_ptr != '<' (stay in this loop skipping text nodes).
+ *      Each iteration that does not start with '<' must advance xml_ptr by
+ *      one character (xml_ptr++) to avoid an infinite loop on text content.
  *      Break out when *xml_ptr == '<' or *xml_ptr == '\0'.
  *   2. If *xml_ptr is '\0' (end of input), return 0.
- *   3. Advance past '<'.
- *   4. If next char is '?': skip to '>' (XML processing instruction) and
- *      loop back to step 1.
- *   5. If next char is '/': it is a closing tag.
- *      CHOICE: skip the '/' so out[] receives just the bare tag name.
- *      The caller distinguishes closing tags by tracking nesting depth.
- *      (Alternative: keep the '/' prefix in out[] and document that choice.)
- *   6. Read characters into out[] while the char is not whitespace, '>', '/':
- *        out[len++] = *xml_ptr++
- *      Stop when len == max_len - 1.
- *   7. Null-terminate out[len] and return 1 if len > 0, else 0.
+ *   3. Advance past '<':  xml_ptr++
+ *   4. If next char is '?': skip to '>' (XML processing instruction such as
+ *      <?xml version="1.0"?>) and loop back to step 1 by calling
+ *      parse_tag_name() recursively.
+ *   5. If next char is '/': it is a closing tag (e.g. </link>).
+ *      Skip the '/' with xml_ptr++ so that out[] receives just the bare
+ *      tag name "link".  The caller distinguishes opening from closing tags
+ *      by tracking nesting depth with a counter variable.
+ *   6. Read characters into out[] while the current char is not whitespace,
+ *      '>', or '/':
+ *        if (len < max_len - 1) out[len++] = *xml_ptr;
+ *        xml_ptr++;
+ *      Stop when len == max_len - 1 (buffer full) or the stop chars appear.
+ *   7. Null-terminate:  out[len] = '\0';
+ *      Return 1 if len > 0 (a name was found), else 0.
  *
  * Return 1 on success, 0 if no tag was found.
  * ══════════════════════════════════════════════════════════════════ */
@@ -116,19 +166,30 @@ static int parse_tag_name(char *out, int max_len) {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #2: parse_attribute — parse one name="value" pair
  *
- * The parser is positioned somewhere inside a tag (after the tag name).
+ * xml_ptr is positioned somewhere inside a tag body, after the tag name.
+ * On each call we consume exactly one attribute and advance xml_ptr past
+ * the closing quote of that attribute's value.
  *
  * Algorithm:
- *   1. skip_whitespace().
+ *   1. skip_whitespace() — consume any spaces between attributes.
  *   2. If *xml_ptr is '>', '/', or '\0': no more attributes — return 0.
- *   3. Read attribute name into name[] until '=', whitespace, or end.
- *      Null-terminate.
- *   4. skip_whitespace(); expect '=' — if not found return 0; advance past it.
- *   5. skip_whitespace(); expect '"' or '\''.
- *      Save the quote character, then advance past it.
- *   6. Read into value[] until the matching closing quote (or end of string).
- *      Null-terminate.
- *   7. Advance past the closing quote.  Return 1.
+ *      (These characters mark the end of the opening tag.)
+ *   3. Read attribute name into name[] until '=', whitespace, or end:
+ *        while (*xml_ptr && *xml_ptr != '=' &&
+ *               !isspace(*xml_ptr) && *xml_ptr != '>')
+ *          name[len++] = *xml_ptr++;
+ *      Null-terminate name[len] = '\0'.
+ *   4. skip_whitespace(); then check *xml_ptr == '='.
+ *      If not '=' (malformed XML): return 0.
+ *      Advance past '=':  xml_ptr++
+ *   5. skip_whitespace(); then check *xml_ptr is '"' or '\''.
+ *      Save the quote character:  char quote = *xml_ptr++;
+ *   6. Read into value[] until the matching closing quote or end of string:
+ *        while (*xml_ptr && *xml_ptr != quote)
+ *          value[len++] = *xml_ptr++;
+ *      Null-terminate value[len] = '\0'.
+ *   7. Advance past the closing quote:  if (*xml_ptr == quote) xml_ptr++;
+ *      Return 1.
  *
  * Return 1 if an attribute was successfully parsed, 0 otherwise.
  * ══════════════════════════════════════════════════════════════════ */
@@ -141,14 +202,28 @@ static int parse_attribute(char *name, int name_max, char *value, int val_max) {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #3: load_file — read an entire file into a heap buffer
  *
- * Algorithm:
- *   1. fopen(filename, "r") — print error and return -1 on failure.
- *   2. fseek(f, 0, SEEK_END); size = ftell(f); rewind(f).
- *   3. buf = malloc(size + 1) — return -1 on allocation failure.
- *   4. fread(buf, 1, size, f); buf[size] = '\0'; fclose(f).
- *   5. Store the pointer in *out and return size.
+ * We need the whole file in memory so xml_ptr can scan it freely without
+ * repeated fread() calls.
  *
- * Return the file size (>= 0) on success, -1 on error.
+ * Algorithm:
+ *   1. fopen(filename, "r")
+ *      On failure: perror(filename); return -1;
+ *   2. Seek to end to determine size, then rewind:
+ *        fseek(f, 0, SEEK_END);
+ *        long size = ftell(f);
+ *        rewind(f);
+ *   3. Allocate a buffer one byte larger than the file (for the '\0'):
+ *        char *buf = malloc(size + 1);
+ *        if (!buf) { fclose(f); return -1; }
+ *   4. Read the file and null-terminate:
+ *        size_t n = fread(buf, 1, size, f);
+ *        buf[n] = '\0';
+ *        fclose(f);
+ *   5. Store the pointer in *out and return size (the number of bytes read).
+ *      Note: n may be slightly less than size on text-mode reads on some
+ *      platforms due to CRLF conversion — using n is more correct than size.
+ *
+ * Return the number of bytes read (>= 0) on success, -1 on error.
  * ══════════════════════════════════════════════════════════════════ */
 static long load_file(const char *filename, char **out) {
     /* TODO: Open file, allocate buffer, read contents, null-terminate */
@@ -159,25 +234,32 @@ static long load_file(const char *filename, char **out) {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #4: xml_print_structure — demonstrate the parser
  *
+ * This function ties together load_file, parse_tag_name, and parse_attribute
+ * into a diagnostic tool that prints every tag and its attributes.
+ *
  * Algorithm:
  *   1. Call load_file(filename, &xml_content).
- *      On failure print "Error: cannot open '<filename>'\n" and return.
+ *      On failure: printf("Error: cannot open '%s'\n", filename); return;
  *   2. Set xml_ptr = xml_content.
- *   3. Declare int link_count = 0, joint_count = 0.
- *   4. Loop while parse_tag_name(tag, sizeof(tag)) succeeds:
- *      a. printf("<%s>", tag).
- *      b. Loop parse_attribute(aname, ..., aval, ...):
- *           printf("  %s=\"%s\"", aname, aval)
- *         Track link/joint counts:
- *           if strcmp(tag,"link")==0 && strcmp(aname,"name")==0 → link_count++
- *           if strcmp(tag,"joint")==0 && strcmp(aname,"name")==0 → joint_count++
- *      c. printf("\n").
- *      d. Call skip_to_tag_end() to advance past the '>'.
- *   5. After the loop:
- *      printf("Total: %d links, %d joints\n", link_count, joint_count).
+ *   3. Declare counters: int link_count = 0, joint_count = 0;
+ *   4. Loop: char tag[64]; while (parse_tag_name(tag, sizeof(tag))) {
+ *        a. printf("<%s>", tag)  — print the tag name.
+ *        b. Inner loop: char aname[64], aval[256];
+ *             while (parse_attribute(aname, sizeof(aname), aval, sizeof(aval))) {
+ *               printf("  %s=\"%s\"", aname, aval);
+ *               if (strcmp(tag,"link")==0  && strcmp(aname,"name")==0) link_count++;
+ *               if (strcmp(tag,"joint")==0 && strcmp(aname,"name")==0) joint_count++;
+ *             }
+ *        c. printf("\n");
+ *        d. Call skip_to_tag_end() so xml_ptr moves past the closing '>'.
+ *           Without this step, parse_tag_name() would stall on the same '>'.
+ *      }
+ *   5. After the loop, print totals:
+ *        printf("Total: %d links, %d joints\n", link_count, joint_count);
  *
- * Note: closing tags (e.g. </link>) will also be printed; that is fine for
- * this diagnostic tool.
+ * Note: closing tags (</link>, </joint>, etc.) also appear in the output;
+ * that is fine for a diagnostic tool — they show up as bare tag names without
+ * attributes (e.g. "<link>\n").
  *
  * Expected output (excerpt):
  *   <robot>  name="my_robot"

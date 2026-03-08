@@ -13,6 +13,50 @@
  * - Understand why smooth_* values differ from the raw azimuth/elevation
  * - Handle terminal resize events with SIGWINCH
  * - Integrate all orbit camera features into a complete interactive demo
+ *
+ * TECHNIQUE OVERVIEW:
+ *
+ * 1. EXPONENTIAL SMOOTHING
+ *    Instead of snapping the camera to the new angle instantly, each frame
+ *    we move the smooth_* values a fraction of the remaining distance:
+ *
+ *      smoothing   = 1 − exp(−k × dt)        where k ≈ 10
+ *      smooth_az  += (azimuth   − smooth_az)  × smoothing
+ *      smooth_el  += (elevation − smooth_el)  × smoothing
+ *      smooth_dist += (distance − smooth_dist) × smoothing
+ *
+ *    Equivalently using lerpf:
+ *      smooth_az = lerpf(smooth_az, azimuth, smoothing)
+ *
+ *    At k=10, dt=0.05 s (20 FPS): smoothing ≈ 0.39 → ~39% catch-up per
+ *    frame.  The camera feels snappy but not jarring.
+ *
+ * 2. WHY EXPONENTIAL SMOOTHING?
+ *    - Frame-rate independent: multiplying by dt means the decay rate in
+ *      real seconds is constant regardless of whether we run at 20 or
+ *      200 FPS.
+ *    - No oscillation: unlike a spring-damper, the value approaches the
+ *      target asymptotically without overshooting.
+ *    - Cheap: only one extra float per parameter, one multiply per frame.
+ *    Mathematically the solution is: smooth(t) = target − (target−initial)
+ *    × exp(−k×t), i.e. an exponential decay toward 'target'.
+ *
+ * 3. "TARGET" vs "SMOOTH" VALUES
+ *    The OrbitCamera struct stores two sets of parameters:
+ *      azimuth / elevation / distance   — updated instantly by key presses
+ *      smooth_az / smooth_el / smooth_dist — follow the targets smoothly
+ *    orbit_camera_pos() and orbit_camera_get_ray() always use the smooth
+ *    values, so the rendered image lags slightly behind input.  This lag
+ *    is the natural inertia feel of professional 3D viewports.
+ *
+ * 4. SIGWINCH AND TERMINAL RESIZE
+ *    When the user resizes their terminal the OS sends SIGWINCH.
+ *    handle_sigwinch() (defined above) sets got_resize = 1 atomically.
+ *    On the next frame the main loop checks the flag, calls
+ *    get_term_size() to query the new dimensions, frees the old Cell
+ *    buffer, allocates a new one, and writes "\033[2J" to clear the
+ *    display.  This pattern — signal sets flag, main loop acts — is
+ *    the safe way to react to signals without race conditions.
  */
 
 #define _POSIX_C_SOURCE 199309L
@@ -331,15 +375,30 @@ static void clamp_camera(OrbitCamera *cam) {
  * TODO #1: Smooth camera interpolation
  *
  * Each frame, advance smooth_* a fraction of the way toward the raw
- * target values.  Use exponential smoothing so the speed is
- * frame-rate independent:
+ * target values using frame-rate-independent exponential smoothing.
  *
+ * FORMULA:
  *   smoothing   = 1.0f - expf(-10.0f * dt)
  *   smooth_az   = lerpf(smooth_az,   azimuth,   smoothing)
  *   smooth_el   = lerpf(smooth_el,   elevation, smoothing)
  *   smooth_dist = lerpf(smooth_dist, distance,  smoothing)
  *
- * Clamp dt to 0.1 s before using it to avoid jumps after pauses.
+ * WHY THIS FORMULA?
+ *   lerpf(a, b, t) = a + (b − a) × t   moves 'a' a fraction t toward 'b'.
+ *   Using t = 1 − exp(−k×dt) instead of a fixed fraction makes the
+ *   catch-up speed proportional to real elapsed time:
+ *     • At dt=0.05 s (20 FPS), k=10 → smoothing ≈ 0.39 (39% per frame)
+ *     • At dt=0.02 s (50 FPS), k=10 → smoothing ≈ 0.18 (18% per frame)
+ *   In both cases the camera reaches ~99% of the target in ~0.5 s.
+ *
+ * CLAMPING dt:
+ *   If the program is paused or the system is heavily loaded, dt could
+ *   be many seconds, causing a large single jump.  Clamp dt to 0.1 s
+ *   (6 frames at 60 FPS) before computing smoothing to prevent this.
+ *
+ * IMPLEMENTATION HINT:
+ *   Remove the placeholder lines below (the snap assignments) and
+ *   replace them with the three lerpf calls shown above.
  * ══════════════════════════════════════════════════════════════════ */
 static void orbit_camera_update(OrbitCamera *cam, float dt) {
     /* TODO: exponentially interpolate smooth_* toward target values.
@@ -354,11 +413,20 @@ static void orbit_camera_update(OrbitCamera *cam, float dt) {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #2: Reset camera to a known default view
  *
- * Set both the raw and the smooth values so the camera snaps
- * instantly (no lag on reset):
- *   azimuth = smooth_az   = 0.3f
- *   elevation = smooth_el = 0.4f
- *   distance = smooth_dist = 10.0f
+ * Assign default values to ALL six angle/distance fields — both the
+ * raw targets and the smooth copies — so the camera snaps instantly
+ * to the default view with no lag:
+ *
+ *   cam->azimuth    = cam->smooth_az   = 0.3f
+ *   cam->elevation  = cam->smooth_el   = 0.4f
+ *   cam->distance   = cam->smooth_dist = 10.0f
+ *
+ * Setting smooth_* equal to the raw values means orbit_camera_update()
+ * will compute smoothing ≈ 0 on the next frame (smooth already equals
+ * target) and the camera position will not drift.  If you only reset
+ * the raw values the smooth values would lag behind and produce a
+ * visible glide from the old position to the default — useful for
+ * some applications but not for a hard "snap to default" reset.
  * ══════════════════════════════════════════════════════════════════ */
 static void orbit_camera_reset(OrbitCamera *cam) {
     /* TODO: restore default angles and snap smooth values to match */
@@ -368,9 +436,17 @@ static void orbit_camera_reset(OrbitCamera *cam) {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #3: Change the camera's look-at target
  *
- * Simply update cam->target to new_target.  The smooth_* values will
- * automatically catch up to the new position on subsequent frames
- * because orbit_camera_update() already handles the interpolation.
+ * Simply assign new_target to cam->target:
+ *
+ *   cam->target = new_target;
+ *
+ * You do NOT need to update the smooth_* fields here.
+ * orbit_camera_pos() adds the spherical offset to cam->target every
+ * frame, so changing target immediately shifts where the sphere is
+ * centred.  The rendered view will jump to the new target on the
+ * very next frame.  If you also want the angles to transition
+ * smoothly you could additionally reset smooth_az/el/dist, but for
+ * a basic focus operation just updating target is sufficient.
  * ══════════════════════════════════════════════════════════════════ */
 static void orbit_camera_focus(OrbitCamera *cam, vec3 new_target) {
     /* TODO: update cam->target */
@@ -429,22 +505,39 @@ static void sleep_ms(int ms) {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #4: Complete the main loop
  *
- * The main loop skeleton below is missing four things you must add:
+ * The skeleton below needs four additions:
  *
- *   (a) Compute dt from the difference between 'now' and 'last_time',
- *       then update last_time = now.
+ * (a) COMPUTE dt
+ *     dt = (float)(now − last_time)
+ *     last_time = now
+ *     Clamp dt to 0.1 s to prevent a large jump after a pause.
+ *     'now' is already read with get_time() at the top of the loop.
  *
- *   (b) Handle terminal resize: if got_resize is set, clear the flag,
- *       call get_term_size(), reallocate screen, and clear the display
- *       with "\033[2J".
+ * (b) HANDLE TERMINAL RESIZE
+ *     if (got_resize) {
+ *         got_resize = 0;
+ *         get_term_size();
+ *         free(screen);
+ *         screen = calloc(term_w * term_h, sizeof(Cell));
+ *         write(STDOUT_FILENO, "\033[2J", 4);
+ *     }
+ *     got_resize is set to 1 by handle_sigwinch() when SIGWINCH fires.
+ *     We must re-allocate the Cell buffer because term_w/term_h changed.
+ *     "\033[2J" clears any stale pixels left by the old geometry.
  *
- *   (c) Call orbit_camera_update(cam, dt) to advance the smooth values.
+ * (c) ADVANCE SMOOTH CAMERA VALUES
+ *     orbit_camera_update(&cam, dt);
+ *     Call this after clamping but before rendering, so the smooth
+ *     values that orbit_camera_get_ray() reads are already updated.
  *
- *   (d) Handle the 'r'/'R' key in the input loop by calling
- *       orbit_camera_reset() instead of returning 1 to quit.
+ * (d) HANDLE RESET KEY
+ *     Add 'r'/'R' detection before calling handle_input():
+ *       if (key == 'r' || key == 'R') { orbit_camera_reset(&cam); continue; }
+ *     or, more neatly, handle it inside the switch in handle_input()
+ *     (not shown here to keep the two functions separate).
  *
- * The rest of the loop (key reading, clamping, rendering, FPS) is
- * already provided.
+ * The rest of the loop — key reading, clamping, rendering, FPS
+ * tracking, HUD drawing, and sleep — is already provided.
  * ══════════════════════════════════════════════════════════════════ */
 int main(void) {
     enable_raw_mode();

@@ -12,6 +12,44 @@
  * - Understand URDF structure: robot → links + joints
  * - Find the root link (the one with no parent joint)
  * - Verify tree structure by printing the kinematic chain
+ *
+ * ──────────────────────────────────────────────────────────────────
+ * TECHNIQUE OVERVIEW
+ * ──────────────────────────────────────────────────────────────────
+ *
+ * 1. URDF STRUCTURE
+ *    A URDF file has two kinds of elements: <link> (a rigid body with
+ *    geometry and inertia) and <joint> (a connection between two links).
+ *    Joints have: parent (parent link name), child (child link name),
+ *    origin (transform from parent frame to joint frame), axis (rotation
+ *    axis for revolute joints), and type (fixed, revolute, prismatic, etc.).
+ *
+ * 2. KINEMATIC TREE
+ *    Links and joints form a tree.  The root link has no parent joint.
+ *    Every other link has exactly one parent joint.  To traverse the tree:
+ *    find the root, then recursively visit children via joints where
+ *    joint.parent_link == current_link_index.
+ *
+ * 3. FINDING THE ROOT
+ *    A link is the root if no joint has it as its child.  Strategy: iterate
+ *    all links; for each link, check whether any joint has
+ *    joint.child_link == link_index.  If none does, that link is the root.
+ *    In practice we track this with Link.parent_joint: initialised to -1 and
+ *    set by parse_joint() when the link appears as a child.
+ *
+ * 4. LINK / JOINT ARRAYS
+ *    We store links in links[MAX_LINKS] and joints in joints[MAX_JOINTS].
+ *    Each Link has a name string, geometry (sphere/box/cylinder with radius /
+ *    size / length), and a world_transform (mat4) computed by FK in phase6c.
+ *    Each Joint has: parent/child link indices, origin (xyz + rpy), axis,
+ *    joint type, and a current position (angle or displacement).
+ *
+ * 5. NAME-BASED LOOKUP
+ *    find_link_by_name(name) searches links[] by strcmp, returning the index
+ *    or -1 if not found.  This is O(n) per lookup but perfectly adequate for
+ *    small robots (typically fewer than 20 links).  Joints are resolved the
+ *    same way: read the "link" attribute value from <parent> or <child>, then
+ *    call find_link_by_name() to get the array index to store in the Joint.
  */
 
 #define _POSIX_C_SOURCE 199309L
@@ -325,33 +363,47 @@ static void parse_origin(vec3 *xyz, vec3 *rpy) {
  *     </inertial>
  *   </link>
  *
- * Algorithm:
- *   1. Read the "name" attribute from the current tag (the <link ...> opening).
- *      Hint: call parse_attribute() in a loop, looking for attr_name=="name".
- *   2. Bounds-check: if robot.num_links >= MAX_LINKS, skip and return.
- *   3. Add a new Link at robot.links[robot.num_links]:
- *        strncpy(link->name, name_value, MAX_NAME - 1);
- *        link->parent_joint = -1;           (will be set by parse_joint)
- *        link->world_transform = m4_identity();
- *        robot.num_links++;
- *   4. Parse child tags in a loop until the closing </link> is found.
- *      Use parse_tag_name() to read each child tag name.
- *      - "link"     → break  (closing tag — same name as opening)
- *      - "visual"   → parse until </visual>:
- *                       "origin"   → parse_origin(&link->visual.origin_xyz,
- *                                                  &link->visual.origin_rpy)
- *                       "geometry" → parse_geometry(&link->visual)
- *                       "material" → read "name" attribute; map to color_id
- *                                    (use: color_id = name[0] % 8 or similar)
- *                       "visual"   → break  (closing </visual>)
- *                       else       → skip_to_tag_end()
- *      - "inertial" → parse until </inertial>:
- *                       "mass"     → read "value" attribute → link->mass
- *                       "inertial" → break
- *                       else       → skip_to_tag_end()
- *      - else       → skip_to_tag_end()
+ * xml_ptr is positioned just after parse_tag_name() returned "link", so it
+ * is sitting inside the opening <link ...> tag before the attributes.
  *
- * Hint: Robot takes a Robot* parameter so you can access robot.links[].
+ * Algorithm:
+ *   1. Read the "name" attribute from the current tag (the <link ...> opening):
+ *        char attr_name[64], attr_value[256], name_value[MAX_NAME] = {0};
+ *        while (parse_attribute(attr_name, ..., attr_value, ...))
+ *            if (strcmp(attr_name, "name") == 0)
+ *                strncpy(name_value, attr_value, MAX_NAME - 1);
+ *      parse_attribute() consumes the '>' internally when it returns 0, so
+ *      you need to call skip_to_tag_end() afterwards to land past '>'.
+ *   2. Bounds-check: if r->num_links >= MAX_LINKS, call
+ *      skip_to_closing_tag("link") and return.
+ *   3. Add a new Link:
+ *        Link *link = &r->links[r->num_links++];
+ *        strncpy(link->name, name_value, MAX_NAME - 1);
+ *        link->parent_joint = -1;        // set later by parse_joint
+ *        link->world_transform = m4_identity();
+ *   4. Parse child tags in a loop:
+ *        char tag[64];
+ *        while (parse_tag_name(tag, sizeof(tag))) {
+ *          "link"     → break  (closing </link> tag; same name as opening)
+ *          "visual"   → skip_to_tag_end() then parse until "visual" again:
+ *                         "origin"   → parse_origin(&link->visual.origin_xyz,
+ *                                                    &link->visual.origin_rpy)
+ *                         "geometry" → skip_to_tag_end(); parse_geometry(&link->visual)
+ *                         "material" → read "name" attr; color_id = name[0] % 8;
+ *                                       skip_to_tag_end();
+ *                         "visual"   → break  (closing </visual>)
+ *                         else       → skip_to_tag_end()
+ *          "inertial" → skip_to_tag_end() then parse until "inertial" again:
+ *                         "mass"     → read "value" attr → link->mass = parse_float(val)
+ *                                       skip_to_tag_end();
+ *                         "inertial" → break  (closing </inertial>)
+ *                         else       → skip_to_tag_end()
+ *          else       → skip_to_tag_end()
+ *        }
+ *
+ * Hint: Robot takes a Robot* parameter so you can access r->links[].
+ * The provided helpers parse_geometry() and parse_origin() are already
+ * implemented — call them directly rather than re-implementing the logic.
  * ══════════════════════════════════════════════════════════════════ */
 static void parse_link(Robot *r) {
     /* TODO: Parse a <link> XML element and add to r->links[] */
@@ -371,31 +423,53 @@ static void parse_link(Robot *r) {
  *     <limit lower="-1.57" upper="1.57"/>
  *   </joint>
  *
+ * xml_ptr is positioned just after parse_tag_name() returned "joint".
+ *
  * Algorithm:
- *   1. Read "name" and "type" attributes from the opening <joint ...> tag.
- *      Map type string → JointType:
- *        "revolute"   → JOINT_REVOLUTE
- *        "fixed"      → JOINT_FIXED
- *        "prismatic"  → JOINT_PRISMATIC
- *        "continuous" → JOINT_CONTINUOUS
- *        default      → JOINT_FIXED
- *   2. Bounds-check: if r->num_joints >= MAX_JOINTS, skip and return.
- *   3. Add a new Joint at r->joints[r->num_joints]:
- *        joint->axis = v3(0,0,1);   (default)
+ *   1. Read "name" and "type" attributes from the opening <joint ...> tag:
+ *        char jname[MAX_NAME]={0}; JointType jtype=JOINT_FIXED;
+ *        while (parse_attribute(attr_name, ..., attr_value, ...)) {
+ *            if strcmp(attr_name,"name")==0 → strncpy(jname, ...)
+ *            if strcmp(attr_name,"type")==0 → map string to enum:
+ *                "revolute"   → JOINT_REVOLUTE
+ *                "fixed"      → JOINT_FIXED
+ *                "prismatic"  → JOINT_PRISMATIC
+ *                "continuous" → JOINT_CONTINUOUS
+ *                default      → JOINT_FIXED
+ *        }
+ *      Then call skip_to_tag_end() to consume '>'.
+ *   2. Bounds-check: if r->num_joints >= MAX_JOINTS, call
+ *      skip_to_closing_tag("joint") and return.
+ *   3. Add a new Joint with defaults:
+ *        int ji = r->num_joints++;
+ *        Joint *joint = &r->joints[ji];
+ *        strncpy(joint->name, jname, MAX_NAME - 1);
+ *        joint->type = jtype;
+ *        joint->parent_link = joint->child_link = -1;
+ *        joint->axis = v3(0, 0, 1);          // default Z axis
  *        joint->lower_limit = -(float)M_PI;
  *        joint->upper_limit =  (float)M_PI;
- *        r->num_joints++;
- *   4. Parse child tags in a loop until closing </joint>:
- *      - "joint"  → break  (closing tag)
- *      - "parent" → read "link" attribute → joint->parent_link =
- *                     find_link_by_name(value)
- *      - "child"  → read "link" attribute → joint->child_link =
- *                     find_link_by_name(value);
- *                   also set r->links[child_idx].parent_joint = joint_index
- *      - "origin" → parse_origin(&joint->origin_xyz, &joint->origin_rpy)
- *      - "axis"   → read "xyz" attribute → joint->axis = parse_vec3(value)
- *      - "limit"  → read "lower"/"upper" attributes
- *      - else     → skip_to_tag_end()
+ *   4. Parse child tags in a loop:
+ *        char tag[64];
+ *        while (parse_tag_name(tag, sizeof(tag))) {
+ *          "joint"  → break  (closing </joint>)
+ *          "parent" → read "link" attr value → joint->parent_link =
+ *                       find_link_by_name(value); skip_to_tag_end()
+ *          "child"  → read "link" attr value:
+ *                       int ci = find_link_by_name(value);
+ *                       joint->child_link = ci;
+ *                       if (ci >= 0) r->links[ci].parent_joint = ji;
+ *                       skip_to_tag_end()
+ *                       // This back-link lets us find the root later.
+ *          "origin" → parse_origin(&joint->origin_xyz, &joint->origin_rpy)
+ *          "axis"   → read "xyz" attr → joint->axis = parse_vec3(value);
+ *                       skip_to_tag_end()
+ *          "limit"  → read "lower" and "upper" attrs:
+ *                       joint->lower_limit = parse_float(lower_val)
+ *                       joint->upper_limit = parse_float(upper_val)
+ *                       skip_to_tag_end()
+ *          else     → skip_to_tag_end()
+ *        }
  * ══════════════════════════════════════════════════════════════════ */
 static void parse_joint(Robot *r) {
     /* TODO: Parse a <joint> XML element and add to r->joints[] */
@@ -405,22 +479,37 @@ static void parse_joint(Robot *r) {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #3: load_urdf — parse the entire URDF file into *r
  *
+ * This is the top-level entry point.  It clears the Robot structure,
+ * loads the file, then dispatches to parse_link() / parse_joint() for
+ * each element encountered.
+ *
  * Algorithm:
- *   1. memset(r, 0, sizeof(*r));
- *      r->root_link = -1;
- *      for (int i = 0; i < MAX_LINKS; i++) r->links[i].parent_joint = -1;
- *   2. Load the file into xml_content using load_file() below.
- *      On failure print "Error: cannot open '<filename>'\n" and return 0.
+ *   1. Zero out the robot and set sentinel values:
+ *        memset(r, 0, sizeof(*r));
+ *        r->root_link = -1;
+ *        for (int i = 0; i < MAX_LINKS; i++) r->links[i].parent_joint = -1;
+ *   2. Load the file:
+ *        if (load_file(filename, &xml_content) < 0) {
+ *            fprintf(stderr, "Error: cannot open '%s'\n", filename);
+ *            return 0;
+ *        }
  *   3. Set xml_ptr = xml_content.
- *   4. Loop calling parse_tag_name(tag, ...):
- *      - "robot"  → read "name" attribute → strncpy(r->name, ...)
- *                   then skip_to_tag_end()
- *      - "link"   → parse_link(r)
- *      - "joint"  → parse_joint(r)
- *      - else     → skip_to_tag_end()
- *   5. Find the root link: the first link with parent_joint == -1.
- *      Store its index in r->root_link.
- *   6. Return 1 on success.
+ *   4. Main parse loop:
+ *        char tag[64], an[64], av[256];
+ *        while (parse_tag_name(tag, sizeof(tag))) {
+ *          "robot"  → read "name" attribute:
+ *                       strncpy(r->name, av, MAX_NAME - 1);
+ *                       then skip_to_tag_end()
+ *          "link"   → parse_link(r)
+ *                       (parse_link consumes up to and including </link>)
+ *          "joint"  → parse_joint(r)
+ *                       (parse_joint consumes up to and including </joint>)
+ *          else     → skip_to_tag_end()
+ *        }
+ *   5. Find root link — the first link whose parent_joint is still -1:
+ *        for (int i = 0; i < r->num_links; i++)
+ *            if (r->links[i].parent_joint == -1) { r->root_link = i; break; }
+ *   6. Return 1 (success).
  *
  * Helper (provided, implemented):
  * ══════════════════════════════════════════════════════════════════ */
@@ -447,7 +536,7 @@ static int load_urdf(Robot *r, const char *filename) {
  * TODO #4: print_robot_tree — print the kinematic chain as ASCII art
  *
  * Walk the kinematic tree starting at the root link, following joints
- * depth-first.  For each level of depth, indent with two spaces.
+ * depth-first.  For each level of depth, indent with two spaces per level.
  *
  * Expected output:
  *   Robot: my_robot (5 links, 4 joints)
@@ -456,21 +545,37 @@ static int load_urdf(Robot *r, const char *filename) {
  *         joint1 (revolute) → [2] link2  (box 0.10×0.10×0.10)
  *         ...
  *
- * Algorithm (recursive helper print_link(r, link_idx, depth)):
- *   1. Print "  " * depth then link info:
- *        "[<idx>] <name>  (<geom type and size>)"
- *      Geometry formatting:
- *        GEOM_SPHERE   → "sphere r=%.2f"
- *        GEOM_CYLINDER → "cylinder r=%.2f l=%.2f"
- *        GEOM_BOX      → "box %.2f×%.2f×%.2f"  (sizes are half-extents×2)
- *   2. For each joint j where j.parent_link == link_idx:
- *        Print "  " * (depth+1) then:
- *          "<joint_name> (<joint_type>) → "
- *        Call print_link(r, j.child_link, depth + 2).
+ * Algorithm — implement a recursive helper:
  *
- * Joint type strings: "fixed" / "revolute" / "prismatic" / "continuous"
+ *   static void print_link(Robot *r, int link_idx, int depth) {
+ *     // 1. Print (depth * 2) spaces for indentation.
+ *     // 2. Print link info:
+ *     //      "[<idx>] <name>  (<geometry description>)"
+ *     //    Geometry descriptions:
+ *     //      GEOM_SPHERE:   "sphere r=%.2f", geom->radius
+ *     //      GEOM_CYLINDER: "cylinder r=%.2f l=%.2f", geom->radius, geom->length
+ *     //      GEOM_BOX:      "box %.2f×%.2f×%.2f"
+ *     //                     sizes are half-extents stored in geom->size,
+ *     //                     so multiply by 2 to get full dimensions.
+ *     // 3. For each joint j in r->joints[] where j.parent_link == link_idx:
+ *     //      Print (depth+1)*2 spaces, then:
+ *     //        "<joint_name> (<joint_type_string>) → "
+ *     //      Then call print_link(r, j.child_link, depth + 2).
+ *     //    Joint type strings:
+ *     //      JOINT_FIXED      → "fixed"
+ *     //      JOINT_REVOLUTE   → "revolute"
+ *     //      JOINT_PRISMATIC  → "prismatic"
+ *     //      JOINT_CONTINUOUS → "continuous"
+ *   }
  *
- * print_robot_tree() prints the header and calls print_link(r, r->root_link, 1).
+ *   void print_robot_tree(Robot *r) {
+ *     // Print header: "Robot: <name> (<num_links> links, <num_joints> joints)\n"
+ *     // Guard: if r->root_link < 0, print "  (no root link found)\n" and return.
+ *     // Call print_link(r, r->root_link, 1).
+ *   }
+ *
+ * The (void) suppressions for unused math symbols belong inside print_robot_tree
+ * so the compiler is satisfied even before the helpers are used.
  * ══════════════════════════════════════════════════════════════════ */
 static void print_robot_tree(Robot *r) {
     /* TODO: Print ASCII tree of the kinematic chain */

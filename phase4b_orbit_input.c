@@ -13,6 +13,39 @@
  * - Map keyboard inputs to camera parameter changes
  * - Clamp camera elevation and distance to valid ranges
  * - Run a real-time render loop at ~20 FPS
+ *
+ * TECHNIQUE OVERVIEW:
+ *
+ * 1. KEYBOARD-TO-PARAMETER MAPPING
+ *    Each key controls exactly one spherical coordinate:
+ *      A / Left-arrow  → azimuth  −= MOVE_SPEED   (orbit camera left)
+ *      D / Right-arrow → azimuth  += MOVE_SPEED   (orbit camera right)
+ *      W / Up-arrow    → elevation += MOVE_SPEED  (orbit camera up)
+ *      S / Down-arrow  → elevation -= MOVE_SPEED  (orbit camera down)
+ *      + / =           → distance  -= ZOOM_SPEED  (zoom in toward target)
+ *      - / _           → distance  += ZOOM_SPEED  (zoom out from target)
+ *    MOVE_SPEED and ZOOM_SPEED are compile-time constants defined above.
+ *    Because the render loop runs at ~20 FPS, each held key adds
+ *    MOVE_SPEED radians per frame ≈ 3 radians/s of rotation.
+ *
+ * 2. CLAMPING
+ *    Elevation must stay in (-π/2, +π/2) or the look-at vector flips.
+ *    We clamp to [-π/2 + 0.1, π/2 - 0.1] so the camera never reaches
+ *    the poles, which would make cross(forward, world_up) degenerate.
+ *    Distance must stay positive to avoid passing through or behind
+ *    the target; we clamp to [3.0, 30.0].
+ *
+ * 3. REAL-TIME RENDER LOOP AT 20 FPS
+ *    Frame structure each iteration:
+ *      (a) Drain all pending keys with read_key() in a tight loop
+ *      (b) Clamp the updated parameters
+ *      (c) Copy raw values to smooth_* (no lag in phase 4b)
+ *      (d) Ray-march the full screen with render_frame()
+ *      (e) Flush the double buffer with present_screen()
+ *      (f) Update and draw the HUD
+ *      (g) sleep_ms(50) to target a 50 ms / 20 FPS budget
+ *    Ray marching every pixel is slow; 20 FPS keeps the interaction
+ *    responsive without overwhelming the renderer.
  */
 
 #define _POSIX_C_SOURCE 199309L
@@ -340,14 +373,33 @@ static void sleep_ms(int ms) {
  *
  * Returns 0 to keep running, 1 to quit.
  *
- * Switch on key and adjust the raw camera parameters:
- *   KEY_UP   / 'w' / 'W' : cam->elevation += MOVE_SPEED
- *   KEY_DOWN / 's' / 'S' : cam->elevation -= MOVE_SPEED
- *   KEY_LEFT / 'a' / 'A' : cam->azimuth   -= MOVE_SPEED
- *   KEY_RIGHT/ 'd' / 'D' : cam->azimuth   += MOVE_SPEED
- *   '+' / '='             : cam->distance  -= ZOOM_SPEED  (zoom in)
- *   '-' / '_'             : cam->distance  += ZOOM_SPEED  (zoom out)
- *   'q' / 'Q' / KEY_ESC  : return 1 (quit)
+ * This function is called once per key event inside the frame loop.
+ * Use a switch statement to map each key to its camera parameter:
+ *
+ *   KEY_UP   / 'w' / 'W' → cam->elevation += MOVE_SPEED
+ *     Orbits the camera upward (toward the top of the target sphere).
+ *
+ *   KEY_DOWN / 's' / 'S' → cam->elevation -= MOVE_SPEED
+ *     Orbits the camera downward (toward the bottom of the sphere).
+ *
+ *   KEY_LEFT / 'a' / 'A' → cam->azimuth -= MOVE_SPEED
+ *     Rotates the camera horizontally counter-clockwise around Y.
+ *
+ *   KEY_RIGHT/ 'd' / 'D' → cam->azimuth += MOVE_SPEED
+ *     Rotates the camera horizontally clockwise around Y.
+ *
+ *   '+' / '=' → cam->distance -= ZOOM_SPEED
+ *     Shrinks the orbit radius, moving the camera closer to the target.
+ *
+ *   '-' / '_' → cam->distance += ZOOM_SPEED
+ *     Grows the orbit radius, moving the camera farther from the target.
+ *
+ *   'q' / 'Q' / KEY_ESC → return 1
+ *     Signal the main loop to exit.
+ *
+ * Azimuth wrapping is NOT needed — it can grow unboundedly and trig
+ * handles it correctly.  Elevation and distance are clamped in the
+ * separate clamp_camera() call after this function returns.
  * ══════════════════════════════════════════════════════════════════ */
 static int handle_input(OrbitCamera *cam, int key) {
     /* TODO: map key to camera parameter changes */
@@ -358,9 +410,22 @@ static int handle_input(OrbitCamera *cam, int key) {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #2: Clamp camera parameters to valid ranges
  *
- * Prevent the camera from going through the poles or the target:
- *   elevation : clamp to [-π/2 + 0.1,  π/2 - 0.1]
- *   distance  : clamp to [3.0, 30.0]
+ * After handle_input() modifies the raw parameters, enforce limits:
+ *
+ * ELEVATION clamping: [-π/2 + 0.1,  +π/2 - 0.1]
+ *   The look-at math computes cross(forward, world_up).  When forward
+ *   is exactly parallel to world_up (el = ±π/2), the cross product is
+ *   the zero vector, breaking normalisation.  Leaving a 0.1-radian
+ *   margin avoids this singularity and keeps the view stable.
+ *   Use fmaxf/fminf for a branchless clamp.
+ *
+ * DISTANCE clamping: [3.0, 30.0]
+ *   Below 3.0 units the camera clips through objects and the SDF
+ *   surface threshold becomes unreliable.  Above 30.0 the scene
+ *   becomes too small to be useful and ray marching hits MAX_DIST.
+ *
+ * Azimuth does NOT need clamping — it can grow without limit because
+ * sinf/cosf are naturally periodic over 2π.
  * ══════════════════════════════════════════════════════════════════ */
 static void clamp_camera(OrbitCamera *cam) {
     /* TODO: clamp elevation and distance */
@@ -370,13 +435,23 @@ static void clamp_camera(OrbitCamera *cam) {
 /* ══════════════════════════════════════════════════════════════════
  * TODO #3: Draw HUD line at top of screen
  *
- * Use an ANSI escape to position the cursor at (1,1), then print:
- *   FPS, azimuth in degrees, elevation in degrees, distance
+ * Overlay a single line of status text without disturbing the rendered
+ * frame.  Use an ANSI escape sequence to jump the cursor to the top-
+ * left corner before writing, so the HUD overwrites whatever was
+ * rendered there.
  *
- * Example format:
+ * Suggested format (write with write() or printf + fflush):
  *   " Phase 4b | FPS: 20 | Az: 17.2°  El: 22.9°  Dist: 10.0 | ..."
  *
- * Tip: degrees = radians * (180 / M_PI)
+ * Conversion: radians × (180 / M_PI) = degrees
+ *
+ * Recommended approach:
+ *   1. snprintf into a local char buffer
+ *   2. Prepend "\033[1;1H" to place cursor at row 1, col 1
+ *   3. Add color escapes (e.g. bright yellow on black) for visibility
+ *   4. write(STDOUT_FILENO, buf, strlen(buf))
+ *
+ * Keep the buffer short enough (< 256 bytes) to avoid partial writes.
  * ══════════════════════════════════════════════════════════════════ */
 static void draw_hud(OrbitCamera *cam, double fps) {
     /* TODO: render HUD showing fps, azimuth/elevation in degrees, distance */
